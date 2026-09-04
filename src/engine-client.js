@@ -145,4 +145,81 @@ export class BreezeEngineClient {
         }
         throw lastError ?? new Error('合成失败');
     }
+
+    /**
+     * 流式合成：边接收引擎的 PCM 流边切片产出 WAV data URL，
+     * 首片仅 firstPieceSeconds 秒即可交付播放（引擎 TTFA≈0.13s，RTF≈0.8，
+     * 即首片约 2 秒音频在 ~2 秒内可听到，而无需等整段合成完）。
+     * 参数同 synthesizeOnce；失败时可能已 yield 部分片段（调用方按序播放）。
+     */
+    async *synthesizeStream(p, pieceSeconds = 4, firstPieceSeconds = 2) {
+        const form = new FormData();
+        form.append('text', p.text);
+        form.append('instruction', p.instruction || 'Speak clearly and naturally.');
+        form.append('cfg_scale', String(p.cfgScale ?? 1.0));
+        if (p.seed !== undefined && p.seed !== null) {
+            form.append('seed', String(p.seed));
+        }
+        if (p.refAudio && p.refAudio.data) {
+            const bytes = Uint8Array.from(atob(p.refAudio.data), (c) => c.charCodeAt(0));
+            form.append('ref_audio', new Blob([bytes], { type: p.refAudio.mime || 'audio/wav' }),
+                p.refAudio.name || 'reference.wav');
+            form.append('ref_text', p.refText || '');
+        }
+
+        let lastError = null;
+        for (let attempt = 0; attempt <= this.retries; attempt++) {
+            if (attempt > 0) {
+                await sleep(Math.min(1000 * 2 ** (attempt - 1), 8000));
+            }
+            let res;
+            try {
+                res = await fetch(`${this.endpoint}/v1/audio/speech`, {
+                    method: 'POST', body: form,
+                });
+            } catch (err) {
+                throw new Error(`连接引擎失败：${err?.message ?? err}`);
+            }
+            if (res.status === 409) { lastError = new Error('引擎正忙，已多次重试仍失败'); continue; }
+            if (res.status === 503) { lastError = new Error('引擎正在加载模型'); continue; }
+            if (!res.ok) {
+                const detail = (await res.text()).slice(0, 300);
+                throw new Error(`引擎错误 HTTP ${res.status}：${detail}`);
+            }
+            if (!res.body) { // 极旧环境无流式支持，退化为整段
+                const pcm = await res.arrayBuffer();
+                yield pcm16ToWavDataUrl(pcm);
+                return;
+            }
+
+            const reader = res.body.getReader();
+            let buffer = new Uint8Array(0);
+            let emitted = 0;
+            let pieceIdx = 0;
+            const pieceBytes = (sec) => Math.floor(SAMPLE_RATE * 2 * Math.max(0.2, sec));
+            for (;;) {
+                const { done, value } = await reader.read();
+                if (done) { break; }
+                const next = new Uint8Array(buffer.length + value.length);
+                next.set(buffer);
+                next.set(value, buffer.length);
+                buffer = next;
+                let target = pieceBytes(pieceIdx === 0 ? Math.min(firstPieceSeconds, pieceSeconds) : pieceSeconds);
+                while (buffer.length - emitted >= target) {
+                    yield pcm16ToWavDataUrl(buffer.subarray(emitted, emitted + target));
+                    emitted += target;
+                    pieceIdx++;
+                    target = pieceBytes(pieceSeconds);
+                }
+            }
+            const rest = buffer.length - emitted;
+            if (rest >= 4800) { // 尾片（≥0.1s）也要交付
+                yield pcm16ToWavDataUrl(buffer.subarray(emitted));
+            } else if (rest > 0 && emitted === 0) {
+                throw new Error('引擎返回了空音频（文本可能无法发音）');
+            }
+            return;
+        }
+        throw lastError ?? new Error('合成失败');
+    }
 }

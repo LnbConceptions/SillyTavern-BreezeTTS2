@@ -145,6 +145,34 @@ test('resolveForChunk 规则兜底（无 ctx）', async () => {
     assert.ok(res.emotion, '有兜底情绪名');
 });
 
+test('resolveForChunk 多句合并：缓存命中走合并、skipLLM 走规则', async () => {
+    const settings = { emotionEnabled: true, ruleFallback: true, lexicon: M.DEFAULT_LEXICON, promptTemplate: M.DEFAULT_PROMPT_TEMPLATE, intensityCfg: { 1: 2, 2: 3, 3: 4 } };
+    const fakeCtx = {
+        chat: [],
+        generateQuietPrompt: async ({ quietPrompt }) => {
+            const segs = [...quietPrompt.matchAll(/^(\d+): (.+)$/gm)];
+            const lines = segs.map((m) => {
+                const t = m[2];
+                if (/挑逗|贴到/.test(t)) return { i: Number(m[1]), emotion: '挑逗', intensity: 3, event: null };
+                return { i: Number(m[1]), emotion: '中性', intensity: 1, event: null };
+            });
+            return JSON.stringify({ lines });
+        },
+    };
+    const engine = new M.EmotionEngine(settings, fakeCtx);
+    // 预填第一句的缓存（模拟消息级预分析）
+    await engine.resolveForChunk('他贴到她耳边，声音压得极低。');
+    const merged = await engine.resolveForChunk('他贴到她耳边，声音压得极低。别出声。');
+    assert.equal(merged.emotion, '挑逗', '合并取第一个非中性情绪');
+    assert.equal(merged.intensity, 3);
+    // skipLLM：缓存未命中的新句立即走规则，不调 LLM
+    const before = 0;
+    const r = await engine.resolveForChunk('完全陌生的新句子！！', { skipLLM: true });
+    assert.equal(r.intensity, 3, '规则兜底给出强度');
+    assert.ok(r.byRule, '标记为规则结果');
+    assert.ok(before === 0, 'skipLLM 不触发 LLM');
+});
+
 test('resolveForChunk LLM 主路径 + 缓存', async () => {
     const calls = [];
     const fakeCtx = {

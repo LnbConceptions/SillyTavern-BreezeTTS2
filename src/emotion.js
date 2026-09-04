@@ -245,26 +245,50 @@ export class EmotionEngine {
     }
 
     /**
-     * 取一个合成块的情绪标注：先查缓存（预分析命中），未命中现场补一次单句分析，
-     * LLM 不可用/失败则规则兜底。永不 throw。
+     * 取一个合成块的情绪标注：句级缓存命中则合并返回；未命中时可选择
+     * 跳过 LLM 立即走规则（首块低延迟路径）。永不 throw。
      */
-    async resolveForChunk(chunkText) {
-        const lang = detectLang(chunkText);
-        const key = hashText(chunkText);
-        const cached = this.cache.get(key);
-        if (cached) { return cached; }
-
-        if (this.settings.emotionEnabled && this.ctx && Date.now() >= this.failedUntil) {
-            const single = chunkText.length > 160 ? [chunkText.slice(0, 160)] : [chunkText];
-            try {
-                const res = await this.analyzeBatch(single, this._recentContext());
-                if (res[single[0]]) { return res[single[0]]; }
-            } catch { /* 落入规则 */ }
+    async resolveForChunk(chunkText, { skipLLM = false } = {}) {
+        const sentences = splitSentences(chunkText);
+        if (!sentences.length) { sentences.push(chunkText); }
+        const missing = sentences.filter((s) => !this.cache.has(hashText(s)));
+        if (missing.length) {
+            if (skipLLM || !this.settings.emotionEnabled || !this.ctx || Date.now() < this.failedUntil) {
+                if (this.settings.ruleFallback !== false) {
+                    return this._ruleResult(chunkText, detectLang(chunkText));
+                }
+                return { emotion: null, intensity: 1, event: null };
+            }
+            await this.analyzeBatch(missing, this._recentContext());
         }
+        const merged = this._mergeResults(
+            sentences.map((s) => this.cache.get(hashText(s))).filter(Boolean),
+        );
+        if (merged) { return merged; }
         if (this.settings.ruleFallback !== false) {
-            return this._ruleResult(chunkText, lang);
+            return this._ruleResult(chunkText, detectLang(chunkText));
         }
         return { emotion: null, intensity: 1, event: null };
+    }
+
+    /** 多句合并：情绪取第一个非中性的，强度取最大，事件取第一个 */
+    _mergeResults(results) {
+        if (!results.length) { return null; }
+        let emotion = null;
+        let intensity = 1;
+        let event = null;
+        let byRule = false;
+        for (const r of results) {
+            if (!r) { continue; }
+            if (r.byRule) { byRule = true; }
+            if (emotion === null && r.emotion && r.emotion !== '中性' && r.emotion !== 'neutral') {
+                emotion = r.emotion;
+            }
+            intensity = Math.max(intensity, Number(r.intensity) || 1);
+            if (event === null && r.event) { event = r.event; }
+        }
+        if (emotion === null) { emotion = results[0]?.emotion ?? null; }
+        return { emotion, intensity, event, byRule };
     }
 
     _recentContext() {

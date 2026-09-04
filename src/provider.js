@@ -6,7 +6,7 @@
 import { getContext } from '/scripts/extensions.js';
 
 import { BreezeEngineClient, makeSilentWavDataUrl } from './engine-client.js';
-import { stripForTts, splitIntoChunks, detectLang, hashText } from './text.js';
+import { stripForTts, splitIntoChunks, splitSentences, detectLang, hashText } from './text.js';
 import { VoiceStore, MUTE_VOICE, defaultVoiceProfiles } from './voices.js';
 import { EmotionEngine, DEFAULT_LEXICON, DEFAULT_PROMPT_TEMPLATE, DEFAULT_INTENSITY_CFG } from './emotion.js';
 
@@ -15,6 +15,7 @@ const PROVIDER_NAME = 'Breeze TTS 2';
 const DEFAULT_SETTINGS = () => ({
     endpoint: 'http://127.0.0.1:9897',
     maxChunkChars: 120,
+    pieceSeconds: 4,
     retries: 4,
     debug: false,
     // 情绪引擎
@@ -150,9 +151,11 @@ export class BreezeTtsProvider {
                 <label class="breeze2-checkbox"><input id="breeze2_strip_asterisks" type="checkbox" /> 删除 *动作描写*（未开启多声线时建议开启）</label>
                 <div class="breeze2-grid3">
                     <label>单块最大字数<input id="breeze2_maxchunk" type="number" min="40" max="180" step="10" /></label>
+                    <label>流式片长（秒）<input id="breeze2_piecesec" type="number" min="1" max="10" step="0.5" /></label>
                     <label>409 重试次数<input id="breeze2_retries" type="number" min="0" max="8" step="1" /></label>
                     <label class="breeze2-checkbox"><input id="breeze2_debug" type="checkbox" /> 调试日志</label>
                 </div>
+                <div class="breeze2-hint">流式片长越小首声越快（引擎 TTFA≈0.13s，首片 2 秒即出声），但片段接缝更频繁；出现明显停顿感可调大到 5~6。</div>
             </details>
         </div>`;
     }
@@ -180,6 +183,7 @@ export class BreezeTtsProvider {
         this.emotion = new EmotionEngine(this.settings, getContext());
 
         this._bindUi();
+        this._wirePreAnalysis();
         this._refreshVoiceUi();
         this._checkHealth();
     }
@@ -252,16 +256,22 @@ export class BreezeTtsProvider {
         }
         if (!chunks.length) { return; }
 
-        for (const chunk of chunks) {
-            const req = await this._buildRequest(chunk, profile, segType);
-            const dataUrl = await this.client.synthesizeOnce(req);
-            yield dataUrl; // 下一块在 ST 播放本块期间合成（引擎单并发天然串行）
+        // 后台预热整段台词的情绪缓存（不阻塞首块）；首块若缓存未就绪则走规则立即出声
+        const allSentences = [...new Set(chunks.flatMap((c) => splitSentences(c)))];
+        const missing = allSentences.filter((s) => !this.emotion.cache.has(hashText(s)));
+        if (missing.length && this.settings.emotionEnabled) {
+            this.emotion.analyzeBatch(missing, this.emotion._recentContext()).catch(() => {});
+        }
+
+        for (const [i, chunk] of chunks.entries()) {
+            const req = await this._buildRequest(chunk, profile, segType, { skipLLM: i === 0 });
+            yield* this.client.synthesizeStream(req, this.settings.pieceSeconds, 2);
         }
     }
 
     // segType: 'dialogue' | 'action' | 'narration'（来自 voiceMapKey）。
     // 当前三路共用同一情绪管线，参数预留给旁白差异化语气。
-    async _buildRequest(chunk, profile, segType = 'dialogue') {
+    async _buildRequest(chunk, profile, segType = 'dialogue', { skipLLM = false } = {}) {
         const lang = profile.lang && profile.lang !== 'auto' ? profile.lang : detectLang(chunk);
 
         let instruction = profile.mode === 'design'
@@ -273,9 +283,8 @@ export class BreezeTtsProvider {
 
         let text = chunk;
 
-        // 旁白/动作段可以选用叙述语气；对话段走情绪引擎
         if (this.settings.emotionEnabled) {
-            const result = await this.emotion.resolveForChunk(chunk);
+            const result = await this.emotion.resolveForChunk(chunk, { skipLLM });
             if (result) {
                 instruction = this.emotion.compileInstruction(instruction, result, lang);
                 if (profile.mode !== 'design') {
@@ -303,6 +312,34 @@ export class BreezeTtsProvider {
             refAudio: profile.mode === 'clone' ? profile.refAudio : null,
             refText: profile.mode === 'clone' ? profile.refText : '',
         };
+    }
+
+    /**
+     * 消息渲染即后台预分析情绪（与 TTS 排队并行），等 generateTts 到来时
+     * 缓存多半已就绪——首块不被 LLM 阻塞的关键之一。
+     */
+    _wirePreAnalysis() {
+        if (this._preAnalysisWired) { return; }
+        try {
+            const ctx = getContext();
+            if (!ctx?.eventSource || !ctx?.eventTypes) { return; }
+            this._preAnalysisWired = true;
+            ctx.eventSource.on(ctx.eventTypes.CHARACTER_MESSAGE_RENDERED, (messageId) => {
+                try {
+                    const msg = ctx.chat?.[messageId];
+                    if (!msg || msg.is_system || !msg.mes) { return; }
+                    const cleaned = stripForTts(msg.mes, { stripAsterisks: this.settings.stripAsterisks });
+                    const sentences = splitSentences(cleaned);
+                    const missing = sentences.filter((s) => !this.emotion.cache.has(hashText(s)));
+                    if (missing.length && this.settings.emotionEnabled) {
+                        this.emotion.analyzeBatch(missing, this.emotion._recentContext())
+                            .catch(() => {});
+                    }
+                } catch { /* 预分析失败不影响朗读 */ }
+            });
+        } catch (err) {
+            console.warn('[BreezeTTS2] 预分析事件绑定失败:', err?.message ?? err);
+        }
     }
 
     // ────────────────────── UI 绑定 ──────────────────────
@@ -349,6 +386,9 @@ export class BreezeTtsProvider {
         });
         $('#breeze2_maxchunk').val(this.settings.maxChunkChars).on('change', (e) => {
             this.settings.maxChunkChars = Math.min(180, Math.max(40, Number(e.target.value) || 120)); this._save();
+        });
+        $('#breeze2_piecesec').val(this.settings.pieceSeconds).on('change', (e) => {
+            this.settings.pieceSeconds = Math.min(10, Math.max(1, Number(e.target.value) || 4)); this._save();
         });
         $('#breeze2_retries').val(this.settings.retries).on('change', (e) => {
             this.settings.retries = Math.min(8, Math.max(0, Number(e.target.value) || 4));
