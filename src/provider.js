@@ -8,7 +8,7 @@ import { getContext } from '/scripts/extensions.js';
 import { BreezeEngineClient, makeSilentWavDataUrl } from './engine-client.js';
 import { stripForTts, splitIntoChunks, splitSentences, segmentMessage, detectLang, hashText } from './text.js';
 import { VoiceStore, MUTE_VOICE, defaultVoiceProfiles } from './voices.js';
-import { EmotionEngine, DEFAULT_DELIVERY, DEFAULT_PROMPT_TEMPLATE, DEFAULT_INTENSITY_CFG } from './emotion.js';
+import { EmotionEngine, EMOTION_LIST, DEFAULT_DELIVERY, DEFAULT_PROMPT_TEMPLATE, DEFAULT_INTENSITY_CFG } from './emotion.js';
 
 const PROVIDER_NAME = 'Breeze TTS 2';
 
@@ -170,6 +170,7 @@ export class BreezeTtsProvider {
                     <a id="breeze2_apply_prompts" class="menu_button"><span>应用词典/Prompt</span></a>
                     <a id="breeze2_reset_prompts" class="menu_button"><span>恢复默认</span></a>
                     <a id="breeze2_cache_clear" class="menu_button"><span>清空情绪缓存</span></a>
+                    <a id="breeze2_tagger_test" class="menu_button"><i class="fa-solid fa-flask"></i><span>测试打标</span></a>
                 </div>
                 <div class="breeze2-hint">SFW：1喜 2怒 3哀 4乐 5着急 6平静；NSFW：7挑逗 8渐入佳境 9激情互动 10高潮迭起 11缠绵悱恻。</div>
             </details>
@@ -513,6 +514,26 @@ export class BreezeTtsProvider {
         $('#breeze2_cache_clear').on('click', () => {
             this.emotion.clearCache();
             toastr.info('情绪缓存已清空');
+        });
+        $('#breeze2_tagger_test').on('click', async () => {
+            // 用当前填写的连接信息做一次真实打标（NSFW 递进样例，应返回 8=渐入佳境）
+            this.settings.llmBackend = String($('#breeze2_llm_backend').val());
+            this.settings.taggerUrl = val('breeze2_tagger_url');
+            this.settings.taggerModel = val('breeze2_tagger_model');
+            this.settings.taggerKey = val('breeze2_tagger_key');
+            const prompt = (this.settings.promptTemplate ?? DEFAULT_PROMPT_TEMPLATE)
+                .replace('{context}', '（测试）')
+                .replace('{lines}', '1. 她贴近他的耳边，压低声音：别急着走，好戏才刚开始。');
+            const t0 = performance.now();
+            try {
+                const out = await this.emotion._callLLM(prompt, 16);
+                const ms = (performance.now() - t0).toFixed(0);
+                const num = (String(out).match(/\d/g) || [])[0];
+                const emo = num ? (EMOTION_LIST[Number(num) - 1]?.key ?? '?') : '（无数字）';
+                toastr.success(`打标正常：${ms}ms → "${String(out).trim()}"（${emo}）`);
+            } catch (err) {
+                toastr.error(`打标测试失败：${err?.message ?? err}`);
+            }
         });
 
         // 声线库
