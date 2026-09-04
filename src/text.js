@@ -161,18 +161,26 @@ const ONOMATOPOEIA_RE = /^(嗯+|啊+|哦+|噢+|呜+|滴答|哗啦|轰隆|咔嚓|
 const SPEECH_VERB_RE = /[说问道喊叫答吼念读催嘟囔嘀咕]$/;
 
 /**
- * 引号内容的程序级启发判断（LLM 不可用时的兜底；Router 原则：默认按台词处理）。
- * 判为非台词：拟声词；或 ≤4 字、无句读、且引号前不是说话动词（强调/引用）。
+ * 引号内容的三态程序判定：
+ *  - 'speech'    明确是台词（长句 / 带句读 / 前面是说话动词）→ 直接朗读，不问 LLM
+ *  - 'nonspeech' 明确不是台词（拟声词 / ≤3 字的强调引用）→ 按旁白平读，不问 LLM
+ *  - 'ambiguous' 含糊（4~6 字短引号）→ 交给 LLM 判定
  */
-export function heuristicIsSpeech(inner, before = '') {
+export function quoteHeuristic(inner, before = '') {
     const t = String(inner ?? '').trim();
-    if (!t) { return false; }
-    if (ONOMATOPOEIA_RE.test(t)) { return false; }
-    if (/[。！？!?，,；;…～]$/.test(t)) { return true; }
+    if (!t) { return 'nonspeech'; }
+    if (ONOMATOPOEIA_RE.test(t)) { return 'nonspeech'; }
+    if (/[。！？!?，,；;…～]$/.test(t)) { return 'speech'; }
     const beforeClean = String(before ?? '').replace(/[：:，,。\s""」』]+$/u, '');
-    if (SPEECH_VERB_RE.test(beforeClean.slice(-2))) { return true; }
-    if (t.length <= 4) { return false; }
-    return true;
+    if (SPEECH_VERB_RE.test(beforeClean.slice(-2))) { return 'speech'; }
+    if (t.length <= 3) { return 'nonspeech'; }
+    if (t.length <= 6) { return 'ambiguous'; }
+    return 'speech';
+}
+
+/** LLM 不可用时的兜底判定（含糊引号默认按台词处理——Router 原则） */
+export function heuristicIsSpeech(inner, before = '') {
+    return quoteHeuristic(inner, before) !== 'nonspeech';
 }
 
 /**

@@ -6,7 +6,7 @@
 import { getContext } from '/scripts/extensions.js';
 
 import { BreezeEngineClient, makeSilentWavDataUrl, pcm16ToWavDataUrl } from './engine-client.js';
-import { stripForTts, splitIntoChunks, splitSentences, segmentMessage, detectLang, hashText } from './text.js';
+import { stripForTts, splitIntoChunks, splitSentences, segmentMessage, quoteHeuristic, detectLang, hashText } from './text.js';
 import { VoiceStore, MUTE_VOICE, defaultVoiceProfiles } from './voices.js';
 import { EmotionEngine, EMOTION_LIST, DEFAULT_DELIVERY, DEFAULT_PROMPT_TEMPLATE, DEFAULT_INTENSITY_CFG } from './emotion.js';
 
@@ -94,9 +94,6 @@ export class BreezeTtsProvider {
     // ────────────────────── Provider 契约 ──────────────────────
 
     get settingsHtml() {
-        const voiceOptions = this.store.all()
-            .map((v) => `<option value="${v.id}">${v.name}（${v.mode === 'clone' ? '克隆' : '设计'}）</option>`)
-            .join('');
         return `
         <div class="breeze2-settings">
             <div class="breeze2-inline">
@@ -108,66 +105,71 @@ export class BreezeTtsProvider {
 
             <details open>
                 <summary>🎙️ 声线库（克隆 / 设计）</summary>
-                <div class="breeze2-inline">
-                    <select id="breeze2_voice_list" class="breeze2-grow">${voiceOptions}</select>
-                    <a id="breeze2_voice_add" class="menu_button"><i class="fa-solid fa-plus"></i><span>新建</span></a>
+                <div class="breeze2-row">
+                    <select id="breeze2_voice_list" class="breeze2-grow"></select>
                     <a id="breeze2_voice_preview" class="menu_button"><i class="fa-solid fa-play"></i><span>预览</span></a>
-                    <a id="breeze2_voice_del" class="menu_button"><i class="fa-solid fa-trash"></i><span>删除</span></a>
                 </div>
-                <div class="breeze2-inline">
+                <div class="breeze2-row">
+                    <a id="breeze2_voice_add" class="menu_button"><i class="fa-solid fa-plus"></i><span>新建</span></a>
+                    <a id="breeze2_voice_del" class="menu_button"><i class="fa-solid fa-trash"></i><span>删除</span></a>
                     <a id="breeze2_voice_export" class="menu_button"><i class="fa-solid fa-download"></i><span>导出</span></a>
                     <a id="breeze2_voice_import" class="menu_button"><i class="fa-solid fa-upload"></i><span>导入</span></a>
                     <input id="breeze2_import_file" type="file" accept="application/json" hidden />
                 </div>
-                <label>旁白声线（**…** 和引号之外的文字用它平读，不打标）
-                    <select id="breeze2_narrvoice" class="breeze2-grow"></select>
-                </label>
 
                 <div id="breeze2_editor" class="breeze2-editor" hidden>
-                    <label>声线名称 <input id="breeze2_v_name" type="text" class="text_input" /></label>
-                    <label>模式
-                        <select id="breeze2_v_mode">
-                            <option value="design">设计（纯文字描述音色）</option>
-                            <option value="clone">克隆（参考音频 + 精确文字稿）</option>
-                        </select>
-                    </label>
+                    <div class="breeze2-grid3">
+                        <label>声线名称<input id="breeze2_v_name" type="text" class="text_input" /></label>
+                        <label>模式
+                            <select id="breeze2_v_mode">
+                                <option value="design">设计（文字描述音色）</option>
+                                <option value="clone">克隆（参考音频）</option>
+                            </select>
+                        </label>
+                        <label>语言
+                            <select id="breeze2_v_lang">
+                                <option value="auto">自动检测</option>
+                                <option value="zh">中文</option>
+                                <option value="en">English</option>
+                            </select>
+                        </label>
+                    </div>
                     <div id="breeze2_v_clone_box">
-                        <label>参考音频（建议 ≤30 秒、干净人声）<input id="breeze2_v_file" type="file" accept="audio/*" /></label>
-                        <div id="breeze2_v_audio_info" class="breeze2-hint"></div>
-                        <label>参考音频的精确文字稿（一字不差）
+                        <label>参考音频（≤30 秒干净人声，超长自动裁剪）
+                            <input id="breeze2_v_file" type="file" accept="audio/*" />
+                        </label>
+                        <div id="breeze2_v_audio_info" class="breeze2-hint">未选择音频</div>
+                        <label>参考音频的文字稿（逐字对应，含语气词）
                             <textarea id="breeze2_v_reftext" class="text_input" rows="2"></textarea>
                         </label>
                     </div>
-                    <label id="breeze2_v_design_box">音色描述（设计模式：如“温柔的年轻女性，声音清晰柔软”）
+                    <label id="breeze2_v_design_box">音色描述（设计模式）
                         <textarea id="breeze2_v_design" class="text_input" rows="2"></textarea>
                     </label>
-                    <label>默认导演指令（克隆模式下的基础语气，可留空）
+                    <label>基础导演指令（克隆模式的默认语气，可留空）
                         <textarea id="breeze2_v_basedir" class="text_input" rows="2"></textarea>
                     </label>
                     <div class="breeze2-grid3">
                         <label>指令强度 CFG<input id="breeze2_v_cfg" type="number" min="0.5" max="8" step="0.5" /></label>
                         <label>Seed 模式
                             <select id="breeze2_v_seedmode">
-                                <option value="random">随机（每次有变化）</option>
-                                <option value="fixed">固定（可复现）</option>
+                                <option value="random">随机</option>
+                                <option value="fixed">固定</option>
                             </select>
                         </label>
                         <label>固定 Seed<input id="breeze2_v_seed" type="number" step="1" /></label>
                     </div>
-                    <label>语言
-                        <select id="breeze2_v_lang">
-                            <option value="auto">自动检测</option>
-                            <option value="zh">中文</option>
-                            <option value="en">English</option>
-                        </select>
-                    </label>
-                    <div class="breeze2-inline">
+                    <div class="breeze2-row">
                         <a id="breeze2_v_save" class="menu_button"><i class="fa-solid fa-check"></i><span>保存声线</span></a>
                         <a id="breeze2_v_cancel" class="menu_button"><span>取消</span></a>
                     </div>
                 </div>
-                <div class="breeze2-hint">在 TTS 扩展的「Voice Map」里把角色映射到上面的声线名称；开启多声线后可为
-                    引号台词 / *动作* / 旁白 分别指定声线（动作和旁白可选 🔇 静音）。</div>
+
+                <label class="breeze2-checkbox">旁白声线：
+                    <select id="breeze2_narrvoice" class="breeze2-grow"></select>
+                    <span class="breeze2-hint">引号和 **…** 之外的文字用它平读</span>
+                </label>
+                <div class="breeze2-hint">在 TTS 扩展的「Voice Map」里把角色映射到声线名称；开启多声线后可按 引号台词 / *动作* / 旁白 分别指定。</div>
             </details>
 
             <details>
@@ -375,10 +377,17 @@ export class BreezeTtsProvider {
             let segText = seg.text;
             let voice = profile;
 
-            // 引号段：LLM 判定是否台词（0.2s 级，值得等）；非台词 → 归旁白平读
+            // 引号段：程序三态判定优先；只有含糊的短引号才问 LLM
             if (segType === 'quote') {
-                const verdict = await this.emotion.resolveQuote(segText);
-                if (!verdict.isSpeech) { segType = 'narration'; }
+                const h = quoteHeuristic(segText, seg.before);
+                if (h === 'speech') {
+                    segType = 'dialogue';
+                } else if (h === 'nonspeech') {
+                    segType = 'narration';
+                } else {
+                    const verdict = await this.emotion.resolveQuote(segText);
+                    segType = verdict.isSpeech ? 'dialogue' : 'narration';
+                }
             }
             if (segType === 'narration') {
                 voice = narrationProfile;
@@ -480,8 +489,9 @@ export class BreezeTtsProvider {
                     if (!segs.length || !this.settings.emotionEnabled
                         || this.settings.llmBackend === 'off') { return; }
                     const contextLines = this.emotion._recentContext();
-                    // ① 引号"是否台词"判定 ② 内心想法情绪打标 —— 都在后台跑
-                    const quotes = segs.filter((s) => s.type === 'quote');
+                    // ① 含糊引号"是否台词"判定 ② 内心想法情绪打标 —— 都在后台跑
+                    const quotes = segs.filter((s) => s.type === 'quote'
+                        && quoteHeuristic(s.text, s.before) === 'ambiguous');
                     if (quotes.length) {
                         this.emotion.analyzeQuotes(quotes, contextLines).catch(() => {});
                     }

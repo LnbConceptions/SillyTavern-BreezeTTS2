@@ -85,7 +85,35 @@ test('segmentMessage 单星号动作按旁白处理', () => {
     assert.ok(segs[0].text.includes('她挥了挥手') && segs[0].text.includes('走吧'));
 });
 
-test('heuristicIsSpeech 程序启发兜底', () => {
+test('quoteHeuristic 三态判定', () => {
+    // 明确台词
+    assert.equal(T.quoteHeuristic('别急着走，好戏才刚开始。', '她贴近他耳边'), 'speech');
+    assert.equal(T.quoteHeuristic('滚', '他吼道：'), 'speech');
+    // 明确非台词
+    assert.equal(T.quoteHeuristic('咚咚', '门外传来'), 'nonspeech');
+    assert.equal(T.quoteHeuristic('自由', '他所谓的'), 'nonspeech');
+    // 含糊（4~6 字短引号）→ 交 LLM
+    assert.equal(T.quoteHeuristic('你好吗朋友', ''), 'ambiguous');
+    assert.equal(T.quoteHeuristic('晨光正好啊', '她望着'), 'ambiguous');
+});
+
+test('segmentMessage 旁白/引号/内心三分（引号交 LLM 判定）', () => {
+    const segs = T.segmentMessage('**她凑到他耳边。**「别动哦。」他的心跳快得厉害。');
+    assert.deepEqual(segs.map((s) => s.type), ['inner', 'quote', 'narration']);
+    assert.equal(segs[0].text, '她凑到他耳边。');
+    assert.equal(segs[1].text, '别动哦。');
+    assert.ok(segs[1].before.length > 0, 'quote 段携带前置上下文');
+    assert.ok(segs[2].text.includes('心跳'));
+});
+
+test('segmentMessage 单星号动作按旁白处理', () => {
+    const segs = T.segmentMessage('*她挥了挥手。*走吧。');
+    assert.equal(segs.length, 1);
+    assert.equal(segs[0].type, 'narration');
+    assert.ok(segs[0].text.includes('她挥了挥手') && segs[0].text.includes('走吧'));
+});
+
+test('heuristicIsSpeech 兜底（含糊默认台词）', () => {
     // 拟声词 → 非台词
     assert.equal(T.heuristicIsSpeech('咚咚', '门外传来'), false);
     // 短且无句读、前面无说话动词 → 非台词（强调/引用）
@@ -94,8 +122,8 @@ test('heuristicIsSpeech 程序启发兜底', () => {
     assert.equal(T.heuristicIsSpeech('你真的这么想吗？', '她笑了：'), true);
     // 前面是说话动词 → 台词
     assert.equal(T.heuristicIsSpeech('滚', '他吼道：'), true);
-    // 长句默认台词（Router 原则）
-    assert.equal(T.heuristicIsSpeech('这是一句很长很完整的话'), true);
+    // 含糊 → 默认台词（Router 原则）
+    assert.equal(T.heuristicIsSpeech('你好吗朋友', ''), true);
 });
 
 // ── engine-client.js ──
