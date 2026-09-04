@@ -24,7 +24,7 @@ const DEFAULT_SETTINGS = () => ({
     // 情绪引擎
     emotionEnabled: true,
     llmBackend: 'api',         // 'api' 独立打标 API | 'st' SillyTavern 当前 LLM | 'off' 仅规则
-    taggerUrl: '',
+    taggerUrl: 'https://llm.ioioioioio.com:1120/v1',
     taggerModel: 'hy-mt2-7b',
     taggerKey: '',
     taggerTimeout: 12,
@@ -204,6 +204,13 @@ export class BreezeTtsProvider {
             zh: { ...DEFAULT_DELIVERY.zh, ...(this.settings.delivery?.zh ?? {}) },
         };
         this.settings.intensityCfg = { ...DEFAULT_INTENSITY_CFG, ...(this.settings.intensityCfg ?? {}) };
+
+        // 旧版(v1.2)设置迁移：老词典/老 Prompt(JSON lines 格式)与新版数字协议不兼容
+        if (!settings?.delivery && this.settings.promptTemplate.includes('{enum}')) {
+            console.info('[BreezeTTS2] 检测到 v1.2 旧版情绪设置，迁移到 11 情绪数字协议');
+            this.settings.promptTemplate = DEFAULT_PROMPT_TEMPLATE;
+            this.settings.delivery = structuredClone(DEFAULT_DELIVERY);
+        }
         this.settings.voices = Array.isArray(this.settings.voices) && this.settings.voices.length
             ? this.settings.voices : defaults.voices;
 
@@ -347,7 +354,24 @@ export class BreezeTtsProvider {
             for (const [i, chunk] of chunks.entries()) {
                 // 多块时段首块跳过 LLM 立即出声（后续块用打标结果）；单块则等打标
                 const req = await this._buildRequest(chunk, voice, segType, { skipLLM: i === 0 && chunks.length > 1 });
-                yield* this.client.synthesizeStream(req, this.settings.pieceSeconds, 2);
+                // 分块级重试：应对反代/网络的瞬断（HTTP2 reset 等）。
+                // 已经播出部分片段后失败则不重试（避免整句重复）。
+                let attempt = 0;
+                for (;;) {
+                    let yielded = false;
+                    try {
+                        for await (const wav of this.client.synthesizeStream(req, this.settings.pieceSeconds, 2)) {
+                            yielded = true;
+                            yield wav;
+                        }
+                        break;
+                    } catch (err) {
+                        attempt++;
+                        if (yielded || attempt > 2) { throw err; }
+                        console.warn(`[BreezeTTS2] 块合成失败，重试 ${attempt}/2:`, err?.message ?? err);
+                        await new Promise((r) => setTimeout(r, 800 * attempt));
+                    }
+                }
             }
         }
     }
