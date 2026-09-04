@@ -28,22 +28,23 @@ provider.settings.endpoint = ENGINE;
 provider.client.setEndpoint(ENGINE);
 provider.settings.debug = false;
 
-// LLM 桩：按台词内容给确定性的标注
+// LLM 桩：打标协议为纯数字（情绪枚举 1-11）
 let llmCalls = 0;
 globalThis.__ST_CTX__ = {
     chat: [{ is_user: true, name: 'You', mes: '你在干什么？' }],
     generateQuietPrompt: async ({ quietPrompt }) => {
         llmCalls++;
-        const lines = [...quietPrompt.matchAll(/^(\d+): (.+)$/gm)].map((m) => {
-            const t = m[2];
-            if (/！！/.test(t)) { return { i: Number(m[1]), emotion: '亢奋', intensity: 3, event: null }; }
-            if (/……/.test(t)) { return { i: Number(m[1]), emotion: '挑逗', intensity: 2, event: '[笑]' }; }
-            return { i: Number(m[1]), emotion: '温柔', intensity: 1, event: null };
-        });
-        return JSON.stringify({ lines });
+        const lines = [...quietPrompt.matchAll(/^\d+\.\s.+$/gm)];
+        return lines.map((m) => {
+            const t = m[0];
+            if (/！！/.test(t)) { return '9'; }   // 激情互动
+            if (/……/.test(t)) { return '7'; }     // 挑逗
+            return '6';                            // 平静
+        }).join('');
     },
 };
 provider.emotion.setContext(globalThis.__ST_CTX__);
+provider.settings.llmBackend = 'st';
 
 const SAMPLE = '*她凑到他耳边，声音压得很低。*「别动哦……被别人发现就不好了呢。[笑]」她的心跳快得厉害！！';
 

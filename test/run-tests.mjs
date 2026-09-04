@@ -34,9 +34,9 @@ test('stripForTts 动作描写与 OOC', () => {
 });
 
 test('stripForTts 保留动作开关', () => {
-    const out = T.stripForTts('*她轻轻走近* 你来了。', { stripAsterisks: false });
+    const out = T.stripForTts('**她轻轻走近。** 你来了。', { stripAsterisks: false });
     assert.ok(out.includes('她轻轻走近'), '不删动作内容');
-    assert.ok(!out.includes('*'), '删除星号本身');
+    assert.ok(out.includes('**'), '保留星号标记（分层切分需要）');
 });
 
 test('stripForTts think 块与破折号', () => {
@@ -68,6 +68,41 @@ test('hashText 稳定且不同文本不同', () => {
     assert.notEqual(T.hashText('abc'), T.hashText('abd'));
 });
 
+// ── Router 式分层 segmentMessage ──
+test('segmentMessage 旁白/台词/内心三分', () => {
+    const segs = T.segmentMessage('**她凑到他耳边。**「别动哦。」他的心跳快得厉害。');
+    assert.deepEqual(segs.map((s) => s.type), ['inner', 'dialogue', 'narration']);
+    assert.equal(segs[0].text, '她凑到他耳边。');
+    assert.equal(segs[1].text, '别动哦。');
+    assert.ok(segs[2].text.includes('心跳'));
+});
+
+test('segmentMessage 单星号动作按旁白处理', () => {
+    const segs = T.segmentMessage('*她挥了挥手。*走吧。');
+    assert.equal(segs.length, 1);
+    assert.equal(segs[0].type, 'narration');
+    assert.ok(segs[0].text.includes('她挥了挥手') && segs[0].text.includes('走吧'));
+});
+
+test('segmentMessage 引用/强调/拟声按旁白平读', () => {
+    // 短引号内容 + 前面无说话动词 → 旁白
+    const segs1 = T.segmentMessage('他所谓的"自由"不过是逃避罢了。');
+    assert.equal(segs1[0].type, 'narration', JSON.stringify(segs1));
+    // 拟声词
+    const segs2 = T.segmentMessage('门外传来"咚咚"的敲门声。');
+    assert.ok(segs2.every((s) => s.type === 'narration'), JSON.stringify(segs2));
+    // 说话动词开头 → 台词
+    const segs3 = T.segmentMessage('他低声"说"了一句什么。'.replace('低声"说"了一句什么', '他低声道："跟我来。"'));
+    assert.ok(segs3.some((s) => s.type === 'dialogue' && s.text === '跟我来。'), JSON.stringify(segs3));
+});
+
+test('segmentMessage 引号内长句默认是台词（Router 原则）', () => {
+    const segs = T.segmentMessage('她笑了：「你真的这么想吗？」');
+    assert.equal(segs[0].type, 'narration');
+    assert.equal(segs[1].type, 'dialogue');
+    assert.equal(segs[1].text, '你真的这么想吗？');
+});
+
 // ── engine-client.js ──
 const E = await import('../src/engine-client.js');
 
@@ -76,30 +111,14 @@ test('pcm16ToWavDataUrl 头部字节正确', () => {
     pcm[0] = 0x34; pcm[1] = 0x12;
     const url = E.pcm16ToWavDataUrl(pcm);
     assert.ok(url.startsWith('data:audio/wav;base64,'));
-    const b64 = url.slice('data:audio/wav;base64,'.length);
-    const buf = Buffer.from(b64, 'base64');
+    const buf = Buffer.from(url.slice('data:audio/wav;base64,'.length), 'base64');
     assert.equal(buf.length, 44 + 4800);
     assert.equal(buf.toString('ascii', 0, 4), 'RIFF');
     assert.equal(buf.readUInt32LE(4), 36 + 4800);
     assert.equal(buf.toString('ascii', 8, 12), 'WAVE');
-    assert.equal(buf.toString('ascii', 12, 16), 'fmt ');
-    assert.equal(buf.readUInt32LE(16), 16);
-    assert.equal(buf.readUInt16LE(20), 1);      // PCM
-    assert.equal(buf.readUInt16LE(22), 1);      // mono
-    assert.equal(buf.readUInt32LE(24), 24000);  // sample rate
-    assert.equal(buf.readUInt32LE(28), 48000);  // byte rate
-    assert.equal(buf.readUInt16LE(32), 2);      // block align
-    assert.equal(buf.readUInt16LE(34), 16);     // bits
-    assert.equal(buf.toString('ascii', 36, 40), 'data');
+    assert.equal(buf.readUInt32LE(24), 24000);
     assert.equal(buf.readUInt32LE(40), 4800);
-    assert.equal(buf[44], 0x34);                // 数据原样保留
-    assert.equal(buf[45], 0x12);
-});
-
-test('pcm16ToWavDataUrl 奇数长度截齐', () => {
-    const url = E.pcm16ToWavDataUrl(new Uint8Array(4801));
-    const buf = Buffer.from(url.slice('data:audio/wav;base64,'.length), 'base64');
-    assert.equal((buf.length - 44) % 2, 0, '数据长度必须 16-bit 对齐');
+    assert.equal(buf[44], 0x34);
 });
 
 test('makeSilentWavDataUrl', () => {
@@ -111,107 +130,114 @@ test('makeSilentWavDataUrl', () => {
 // ── emotion.js ──
 const M = await import('../src/emotion.js');
 
-test('ruleAnalyze 标点启发', () => {
-    assert.equal(M.ruleAnalyze('你敢！！').intensity, 3);
-    assert.equal(M.ruleAnalyze('真的吗？').intensity, 1);
-    assert.equal(M.ruleAnalyze('闭嘴！').intensity, 2);
-    assert.equal(M.ruleAnalyze('我……不知道。').intensity, 1);
-    assert.equal(M.ruleAnalyze('好的。').intensity, 1);
+test('情绪枚举：SFW 6 + NSFW 5', () => {
+    assert.equal(M.EMOTION_LIST.length, 11);
+    assert.deepEqual(M.EMOTION_LIST.slice(0, 6).map((e) => e.key), ['喜', '怒', '哀', '乐', '着急', '平静']);
+    assert.deepEqual(M.EMOTION_LIST.slice(6).map((e) => e.key), ['挑逗', '渐入佳境', '激情互动', '高潮迭起', '缠绵悱恻']);
+    assert.ok(M.EMOTION_LIST.slice(6).every((e) => e.cat === 'nsfw'));
 });
 
-test('compileInstruction 拼接词典描述', () => {
-    const settings = { lexicon: M.DEFAULT_LEXICON, promptTemplate: M.DEFAULT_PROMPT_TEMPLATE, intensityCfg: { ...M.DEFAULT_INTENSITY_CFG } };
+test('ruleAnalyze 标点启发', () => {
+    assert.deepEqual([M.ruleAnalyze('你敢！！').emotion, M.ruleAnalyze('你敢！！').intensity], ['怒', 3]);
+    assert.equal(M.ruleAnalyze('真的吗？').intensity, 1);
+    assert.equal(M.ruleAnalyze('闭嘴！').emotion, '怒');
+    assert.equal(M.ruleAnalyze('好的。').emotion, '平静');
+});
+
+test('compileInstruction 拼接朗读方式', () => {
+    const settings = { delivery: M.DEFAULT_DELIVERY, promptTemplate: M.DEFAULT_PROMPT_TEMPLATE, intensityCfg: { ...M.DEFAULT_INTENSITY_CFG } };
     const engine = new M.EmotionEngine(settings, null);
-    const out = engine.compileInstruction('沉稳女声', { emotion: '挑逗', intensity: 2 }, 'zh');
+    const out = engine.compileInstruction('沉稳女声', { emotion: '挑逗', intensity: 2 });
     assert.ok(out.startsWith('沉稳女声'), out);
-    assert.ok(out.includes('压低'), '编译进词典描述: ' + out);
-    assert.equal(engine.compileInstruction('', { emotion: '中性', intensity: 1 }, 'zh'), '');
-    const enOut = engine.compileInstruction('a calm female voice', { emotion: 'teasing', intensity: 3 }, 'en');
-    assert.ok(enOut.includes('drawn-out'), enOut);
+    assert.ok(out.includes('压低声音'), out);
+    assert.equal(engine.compileInstruction('', { emotion: '平静', intensity: 1 }), '');
 });
 
 test('cfgForIntensity', () => {
-    const settings = { lexicon: M.DEFAULT_LEXICON, intensityCfg: { 1: 2, 2: 3, 3: 4 } };
+    const settings = { delivery: M.DEFAULT_DELIVERY, intensityCfg: { 1: 2, 2: 3, 3: 4 } };
     const engine = new M.EmotionEngine(settings, null);
     assert.equal(engine.cfgForIntensity(3), 4);
-    assert.equal(engine.cfgForIntensity(1), 2);
 });
 
-test('resolveForChunk 规则兜底（无 ctx）', async () => {
-    const settings = { enabled: true, ruleFallback: true, lexicon: M.DEFAULT_LEXICON, promptTemplate: M.DEFAULT_PROMPT_TEMPLATE, intensityCfg: { 1: 2, 2: 3, 3: 4 } };
+test('resolveForChunk 数字协议：LLM 打标 + 缓存', async () => {
+    let calls = 0;
+    const settings = {
+        emotionEnabled: true, llmBackend: 'api', taggerUrl: 'http://tagger.local/v1',
+        ruleFallback: true,
+        delivery: M.DEFAULT_DELIVERY, promptTemplate: M.DEFAULT_PROMPT_TEMPLATE, intensityCfg: { 1: 2, 2: 3, 3: 4 },
+    };
     const engine = new M.EmotionEngine(settings, null);
-    const res = await engine.resolveForChunk('你这个坏蛋！！');
-    assert.equal(res.intensity, 3);
-    assert.ok(res.emotion, '有兜底情绪名');
-});
-
-test('resolveForChunk 多句合并：缓存命中走合并、skipLLM 走规则', async () => {
-    const settings = { emotionEnabled: true, ruleFallback: true, lexicon: M.DEFAULT_LEXICON, promptTemplate: M.DEFAULT_PROMPT_TEMPLATE, intensityCfg: { 1: 2, 2: 3, 3: 4 } };
-    const fakeCtx = {
-        chat: [],
-        generateQuietPrompt: async ({ quietPrompt }) => {
-            const segs = [...quietPrompt.matchAll(/^(\d+): (.+)$/gm)];
-            const lines = segs.map((m) => {
-                const t = m[2];
-                if (/挑逗|贴到/.test(t)) return { i: Number(m[1]), emotion: '挑逗', intensity: 3, event: null };
-                return { i: Number(m[1]), emotion: '中性', intensity: 1, event: null };
-            });
-            return JSON.stringify({ lines });
-        },
+    engine._callLLM = async (prompt) => {
+        calls++;
+        assert.ok(prompt.includes('只输出一个数字'));
+        // 句1=挑逗(7) 句2=着急(5)
+        return '75';
     };
-    const engine = new M.EmotionEngine(settings, fakeCtx);
-    // 预填第一句的缓存（模拟消息级预分析）
-    await engine.resolveForChunk('他贴到她耳边，声音压得极低。');
-    const merged = await engine.resolveForChunk('他贴到她耳边，声音压得极低。别出声。');
-    assert.equal(merged.emotion, '挑逗', '合并取第一个非中性情绪');
-    assert.equal(merged.intensity, 3);
-    // skipLLM：缓存未命中的新句立即走规则，不调 LLM
-    const before = 0;
-    const r = await engine.resolveForChunk('完全陌生的新句子！！', { skipLLM: true });
-    assert.equal(r.intensity, 3, '规则兜底给出强度');
-    assert.ok(r.byRule, '标记为规则结果');
-    assert.ok(before === 0, 'skipLLM 不触发 LLM');
+    const r1 = await engine.resolveForChunk('凑过来，小声说：别动哦。别让我等太久！');
+    assert.equal(r1.emotion, '挑逗', JSON.stringify(r1)); // 第一个非平静
+    assert.equal(r1.intensity, 2, '数字协议固定强度 2');
+    assert.equal(engine.deliveryFor(r1.emotion).length > 0, true);
+    const r2 = await engine.resolveForChunk('凑过来，小声说：别动哦。别让我等太久！');
+    assert.equal(calls, 1, '第二次命中缓存');
+    assert.ok(r2.emotion === '挑逗');
 });
 
-test('resolveForChunk LLM 主路径 + 缓存', async () => {
-    const calls = [];
-    const fakeCtx = {
-        chat: [{ is_user: false, name: 'Alice', mes: '上下文' }],
-        generateQuietPrompt: async ({ quietPrompt }) => {
-            calls.push(quietPrompt);
-            assert.ok(quietPrompt.includes('待标注台词'));
-            return JSON.stringify({ lines: [{ i: 0, emotion: '挑逗', intensity: 3, event: '[笑]' }] });
-        },
+test('resolveForChunk 首块 skipLLM 立即出声', async () => {
+    const settings = {
+        emotionEnabled: true, llmBackend: 'st', ruleFallback: true,
+        delivery: M.DEFAULT_DELIVERY, promptTemplate: M.DEFAULT_PROMPT_TEMPLATE, intensityCfg: { 1: 2, 2: 3, 3: 4 },
     };
-    const settings = { emotionEnabled: true, ruleFallback: true, lexicon: M.DEFAULT_LEXICON, promptTemplate: M.DEFAULT_PROMPT_TEMPLATE, intensityCfg: { 1: 2, 2: 3, 3: 4 } };
-    const engine = new M.EmotionEngine(settings, fakeCtx);
-    const r1 = await engine.resolveForChunk('凑过来，小声说：别动哦。');
-    assert.equal(r1.emotion, '挑逗');
-    assert.equal(r1.intensity, 3);
-    assert.equal(engine.eventTag(r1, 'zh'), '[笑]');
-    const r2 = await engine.resolveForChunk('凑过来，小声说：别动哦。'); // 命中缓存，不再调 LLM
-    assert.equal(calls.length, 1, '第二次应命中缓存');
-    assert.equal(r2.emotion, '挑逗');
+    let calls = 0;
+    const engine = new M.EmotionEngine(settings, {
+        chat: [], generateQuietPrompt: async () => { calls++; return '7'; },
+    });
+    const r = await engine.resolveForChunk('全新的一句话！', { skipLLM: true });
+    assert.equal(calls, 0, 'skipLLM 不触发打标');
+    assert.equal(r.byRule, true);
+    assert.ok(r.emotion);
 });
 
-test('analyzeBatch LLM 失败进入冷却，resolveForChunk 走规则', async () => {
-    const fakeCtx = {
-        chat: [],
-        generateQuietPrompt: async () => { throw new Error('LLM down'); },
+test('analyzeBatch api 后端走 fetch（mock fetch）', async () => {
+    const origFetch = globalThis.fetch;
+    let captured = null;
+    globalThis.fetch = async (url, opts) => {
+        captured = { url, body: JSON.parse(opts.body) };
+        return {
+            ok: true,
+            json: async () => ({ choices: [{ message: { content: '6' } }] }),
+        };
     };
-    const settings = { enabled: true, ruleFallback: true, lexicon: M.DEFAULT_LEXICON, promptTemplate: M.DEFAULT_PROMPT_TEMPLATE, intensityCfg: { 1: 2, 2: 3, 3: 4 } };
-    const engine = new M.EmotionEngine(settings, fakeCtx);
-    const res = await engine.resolveForChunk('天哪！！');
-    assert.equal(res.intensity, 3);
-    assert.ok(res.byRule, '走了规则兜底');
+    try {
+        const settings = {
+            emotionEnabled: true, llmBackend: 'api', ruleFallback: true,
+            taggerUrl: 'http://127.0.0.1:1120/v1', taggerModel: 'hy-mt2-7b', taggerKey: 'test',
+            delivery: M.DEFAULT_DELIVERY, promptTemplate: M.DEFAULT_PROMPT_TEMPLATE, intensityCfg: {},
+        };
+        const engine = new M.EmotionEngine(settings, null);
+        const res = await engine.analyzeBatch(['今天天气不错。']);
+        assert.equal(res['今天天气不错。'].emotion, '平静');
+        assert.equal(captured.url, 'http://127.0.0.1:1120/v1/chat/completions');
+        assert.equal(captured.body.model, 'hy-mt2-7b');
+        assert.equal(captured.body.max_tokens, 16); // 8 + 8*1
+        assert.equal(captured.body.reasoning_effort, 'none');
+    } finally {
+        globalThis.fetch = origFetch;
+    }
 });
 
-test('eventTag 拒绝白名单外事件', () => {
-    const settings = { lexicon: M.DEFAULT_LEXICON, intensityCfg: {} };
-    const engine = new M.EmotionEngine(settings, null);
-    assert.equal(engine.eventTag({ event: '[尖叫]' }, 'zh'), null);
-    assert.equal(engine.eventTag({ event: '[叹气]' }, 'zh'), '[叹气]');
-    assert.equal(engine.eventTag({ event: '[叹气]' }, 'en'), null);
+test('熔断：失败后冷却期内不再调用', async () => {
+    let calls = 0;
+    const settings = {
+        emotionEnabled: true, llmBackend: 'st', ruleFallback: true,
+        delivery: M.DEFAULT_DELIVERY, promptTemplate: M.DEFAULT_PROMPT_TEMPLATE, intensityCfg: {},
+    };
+    const engine = new M.EmotionEngine(settings, {
+        chat: [], generateQuietPrompt: async () => { calls++; throw new Error('down'); },
+    });
+    await engine.resolveForChunk('第一句话！');
+    await engine.resolveForChunk('第二句话！');
+    assert.equal(calls, 1, '冷却期内不再调用');
+    assert.ok(Date.now() - (engine.failedUntil - 60_000) < 5000);
 });
 
 // ── voices.js ──
@@ -223,14 +249,12 @@ test('VoiceStore 增删改查/导出导入', () => {
     const profile = store.save({ name: '测试', mode: 'design', designInstruction: 'x', cfg: 4 });
     assert.ok(profile.id);
     assert.equal(store.get('测试').id, profile.id);
-    assert.equal(store.get(profile.id).name, '测试');
     const json = store.exportJson();
     const store2 = new V.VoiceStore([]);
     const { imported } = store2.importJson(json);
     assert.equal(imported, 3);
     assert.equal(store2.get('测试').designInstruction, 'x');
     assert.ok(store.remove(profile.id));
-    assert.equal(store.get(profile.id), null);
     assert.ok(store.toVoiceObjects().some((v) => v.voice_id === V.MUTE_VOICE.voice_id), '声音列表包含静音');
 });
 

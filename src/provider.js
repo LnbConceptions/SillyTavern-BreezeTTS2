@@ -6,9 +6,9 @@
 import { getContext } from '/scripts/extensions.js';
 
 import { BreezeEngineClient, makeSilentWavDataUrl } from './engine-client.js';
-import { stripForTts, splitIntoChunks, splitSentences, detectLang, hashText } from './text.js';
+import { stripForTts, splitIntoChunks, splitSentences, segmentMessage, detectLang, hashText } from './text.js';
 import { VoiceStore, MUTE_VOICE, defaultVoiceProfiles } from './voices.js';
-import { EmotionEngine, DEFAULT_LEXICON, DEFAULT_PROMPT_TEMPLATE, DEFAULT_INTENSITY_CFG } from './emotion.js';
+import { EmotionEngine, DEFAULT_DELIVERY, DEFAULT_PROMPT_TEMPLATE, DEFAULT_INTENSITY_CFG } from './emotion.js';
 
 const PROVIDER_NAME = 'Breeze TTS 2';
 
@@ -18,10 +18,17 @@ const DEFAULT_SETTINGS = () => ({
     pieceSeconds: 4,
     retries: 4,
     debug: false,
+    // 旁白/台词分层（Router 经验）：旁白平铺直叙不打标
+    narrationVoiceId: '',      // 空 = 跟随角色声线
     // 情绪引擎
     emotionEnabled: true,
+    llmBackend: 'api',         // 'api' 独立打标 API | 'st' SillyTavern 当前 LLM | 'off' 仅规则
+    taggerUrl: '',
+    taggerModel: 'hy-mt2-7b',
+    taggerKey: '',
+    taggerTimeout: 12,
     ruleFallback: true,
-    lexicon: structuredClone(DEFAULT_LEXICON),
+    delivery: structuredClone(DEFAULT_DELIVERY),
     promptTemplate: DEFAULT_PROMPT_TEMPLATE,
     intensityCfg: { ...DEFAULT_INTENSITY_CFG },
     // 文本清洗
@@ -32,9 +39,9 @@ const DEFAULT_SETTINGS = () => ({
 
 function segmentTypeFromKey(voiceMapKey) {
     const key = String(voiceMapKey ?? '');
-    if (!key) { return 'dialogue'; }              // 单声线模式：整段按对话处理
+    if (!key) { return null; }                    // 单声线模式：由插件自行切分
     if (key.includes('Quotes')) { return 'dialogue'; }
-    if (key.includes('asterisks')) { return 'action'; }
+    if (key.includes('asterisks')) { return 'inner'; }  // ST 的 *动作* 段按内心独白处理
     return 'narration';
 }
 
@@ -76,6 +83,9 @@ export class BreezeTtsProvider {
                     <a id="breeze2_voice_import" class="menu_button"><i class="fa-solid fa-upload"></i><span>导入</span></a>
                     <input id="breeze2_import_file" type="file" accept="application/json" hidden />
                 </div>
+                <label>旁白声线（**…** 和引号之外的文字用它平读，不打标）
+                    <select id="breeze2_narrvoice" class="breeze2-grow"></select>
+                </label>
 
                 <div id="breeze2_editor" class="breeze2-editor" hidden>
                     <label>声线名称 <input id="breeze2_v_name" type="text" class="text_input" /></label>
@@ -125,18 +135,35 @@ export class BreezeTtsProvider {
             </details>
 
             <details>
-                <summary>🎭 情绪引擎（LLM 台词分析）</summary>
-                <label class="breeze2-checkbox"><input id="breeze2_emotion_enable" type="checkbox" /> 启用 LLM 情绪分析（用当前角色的 LLM，按上下文标注每段朗读语气）</label>
-                <label class="breeze2-checkbox"><input id="breeze2_rule_fallback" type="checkbox" /> LLM 失败时用标点规则兜底</label>
+                <summary>🎭 情绪打标（SFW 6 态 + NSFW 5 态）</summary>
+                <label class="breeze2-checkbox"><input id="breeze2_emotion_enable" type="checkbox" /> 启用台词情绪打标（旁白永远平读，不打标）</label>
+                <label>打标后端
+                    <select id="breeze2_llm_backend">
+                        <option value="api">独立打标 API（OpenAI 兼容，推荐）</option>
+                        <option value="st">SillyTavern 当前 LLM</option>
+                        <option value="off">关闭（仅标点规则）</option>
+                    </select>
+                </label>
+                <div id="breeze2_api_box">
+                    <label>打标 API 地址（OpenAI 兼容，如 https://…/v1）
+                        <input id="breeze2_tagger_url" type="text" class="text_input" />
+                    </label>
+                    <div class="breeze2-grid3">
+                        <label>模型<input id="breeze2_tagger_model" type="text" class="text_input" /></label>
+                        <label>API 密钥<input id="breeze2_tagger_key" type="password" class="text_input" /></label>
+                        <label>超时（秒）<input id="breeze2_tagger_timeout" type="number" min="3" max="60" step="1" /></label>
+                    </div>
+                </div>
+                <label class="breeze2-checkbox"><input id="breeze2_rule_fallback" type="checkbox" /> 打标失败时用标点规则兜底</label>
                 <div class="breeze2-grid3">
                     <label>强度1→CFG<input id="breeze2_cfg1" type="number" min="1" max="8" step="0.5" /></label>
                     <label>强度2→CFG<input id="breeze2_cfg2" type="number" min="1" max="8" step="0.5" /></label>
                     <label>强度3→CFG<input id="breeze2_cfg3" type="number" min="1" max="8" step="0.5" /></label>
                 </div>
-                <label>情绪词典（JSON：zh / en 两组，键=情绪名，值=朗读方式描述）
+                <label>情绪朗读方式（JSON：情绪名 → 描述）
                     <textarea id="breeze2_lexicon" class="text_input breeze2-mono" rows="10"></textarea>
                 </label>
-                <label>导演 Prompt 模板（{enum} {events} {context} {lines}）
+                <label>打标 Prompt 模板（{context} {lines}；输出数字 1-11）
                     <textarea id="breeze2_prompt" class="text_input breeze2-mono" rows="8"></textarea>
                 </label>
                 <div class="breeze2-inline">
@@ -144,6 +171,7 @@ export class BreezeTtsProvider {
                     <a id="breeze2_reset_prompts" class="menu_button"><span>恢复默认</span></a>
                     <a id="breeze2_cache_clear" class="menu_button"><span>清空情绪缓存</span></a>
                 </div>
+                <div class="breeze2-hint">SFW：1喜 2怒 3哀 4乐 5着急 6平静；NSFW：7挑逗 8渐入佳境 9激情互动 10高潮迭起 11缠绵悱恻。</div>
             </details>
 
             <details>
@@ -169,9 +197,8 @@ export class BreezeTtsProvider {
             }
         }
         // 深默认补齐
-        this.settings.lexicon = {
-            zh: { ...DEFAULT_LEXICON.zh, ...(this.settings.lexicon?.zh ?? {}) },
-            en: { ...DEFAULT_LEXICON.en, ...(this.settings.lexicon?.en ?? {}) },
+        this.settings.delivery = {
+            zh: { ...DEFAULT_DELIVERY.zh, ...(this.settings.delivery?.zh ?? {}) },
         };
         this.settings.intensityCfg = { ...DEFAULT_INTENSITY_CFG, ...(this.settings.intensityCfg ?? {}) };
         this.settings.voices = Array.isArray(this.settings.voices) && this.settings.voices.length
@@ -244,33 +271,51 @@ export class BreezeTtsProvider {
             throw new Error(`Breeze 声线 ${voiceId} 不存在，请在设置里检查 Voice Map`);
         }
 
-        const segType = segmentTypeFromKey(voiceMapKey);
         const cleaned = stripForTts(inputText, {
-            stripAsterisks: this.settings.stripAsterisks,
+            stripAsterisks: false,      // 星号标记保留给 segmentMessage 分层
             stripOoc: true,
             stripUnknownBrackets: true,
         });
-        const chunks = splitIntoChunks(cleaned, this.settings.maxChunkChars);
-        if (this.settings.debug) {
-            console.info(`[BreezeTTS2] seg=${segType} 清洗后 ${cleaned.length} 字 → ${chunks.length} 块`, cleaned);
-        }
-        if (!chunks.length) { return; }
+        if (!cleaned) { return; }
 
-        // 后台预热整段台词的情绪缓存（不阻塞首块）；首块若缓存未就绪则走规则立即出声
-        const allSentences = [...new Set(chunks.flatMap((c) => splitSentences(c)))];
-        const missing = allSentences.filter((s) => !this.emotion.cache.has(hashText(s)));
-        if (missing.length && this.settings.emotionEnabled) {
+        // 分层策略：若 ST 多声线模式已经分好段（voiceMapKey 带标记），尊重其分段；
+        // 否则用本插件的 Router 式切分（narration/dialogue/inner）
+        const stType = segmentTypeFromKey(voiceMapKey);
+        const segs = voiceMapKey && stType
+            ? [{ type: stType, text: cleaned }]
+            : segmentMessage(cleaned);
+        if (this.settings.debug) {
+            console.info(`[BreezeTTS2] 分层: ${segs.map((s) => s.type).join('/')}`, segs);
+        }
+        if (!segs.length) { return; }
+
+        const narrationProfile = this.store.get(this.settings.narrationVoiceId) ?? profile;
+
+        // 后台预热台词部分的情绪缓存（不阻塞首块）
+        const diaSentences = [...new Set(
+            segs.filter((s) => s.type !== 'narration').flatMap((s) => splitSentences(s.text)),
+        )];
+        const missing = diaSentences.filter((s) => !this.emotion.cache.has(hashText(s)));
+        if (missing.length && this.settings.emotionEnabled && this.settings.llmBackend !== 'off') {
             this.emotion.analyzeBatch(missing, this.emotion._recentContext()).catch(() => {});
         }
 
-        for (const [i, chunk] of chunks.entries()) {
-            const req = await this._buildRequest(chunk, profile, segType, { skipLLM: i === 0 });
-            yield* this.client.synthesizeStream(req, this.settings.pieceSeconds, 2);
+        for (const seg of segs) {
+            const voice = seg.type === 'narration' ? narrationProfile : profile;
+            // 旁白段清掉残留的星号/下划线符号
+            const segText = seg.type === 'narration'
+                ? seg.text.replace(/[*_]+/g, '').trim()
+                : seg.text;
+            const chunks = splitIntoChunks(segText, this.settings.maxChunkChars);
+            if (!chunks.length) { continue; }
+            for (const [i, chunk] of chunks.entries()) {
+                const req = await this._buildRequest(chunk, voice, seg.type, { skipLLM: i === 0 });
+                yield* this.client.synthesizeStream(req, this.settings.pieceSeconds, 2);
+            }
         }
     }
 
-    // segType: 'dialogue' | 'action' | 'narration'（来自 voiceMapKey）。
-    // 当前三路共用同一情绪管线，参数预留给旁白差异化语气。
+    // segType: 'dialogue' | 'inner' | 'narration'
     async _buildRequest(chunk, profile, segType = 'dialogue', { skipLLM = false } = {}) {
         const lang = profile.lang && profile.lang !== 'auto' ? profile.lang : detectLang(chunk);
 
@@ -282,20 +327,26 @@ export class BreezeTtsProvider {
             : (Number(profile.cfg) || 2);
 
         let text = chunk;
+        const isNarration = segType === 'narration';
 
-        if (this.settings.emotionEnabled) {
-            const result = await this.emotion.resolveForChunk(chunk, { skipLLM });
-            if (result) {
-                instruction = this.emotion.compileInstruction(instruction, result, lang);
-                if (profile.mode !== 'design') {
-                    cfg = Math.max(cfg, this.emotion.cfgForIntensity(result.intensity));
-                }
-                const tag = this.emotion.eventTag(result, lang);
-                if (tag && !text.includes(tag)) {
-                    text = `${tag}${lang === 'en' ? ' ' : ''}${text}`;
+        if (!isNarration) {
+            // 台词/内心独白：情绪打标（首块可跳过 LLM 立即出声）
+            if (this.settings.emotionEnabled) {
+                const result = await this.emotion.resolveForChunk(chunk, { skipLLM });
+                if (result) {
+                    instruction = this.emotion.compileInstruction(instruction, result);
+                    if (profile.mode !== 'design') {
+                        cfg = Math.max(cfg, this.emotion.cfgForIntensity(result.intensity));
+                    }
                 }
             }
+            if (segType === 'inner') {
+                instruction += lang === 'en'
+                    ? ' Spoken softly like an inner monologue.'
+                    : '。以内心的声音轻声自语';
+            }
         }
+        // 旁白：不打标不叠加情绪，声线自身描述即"平铺直叙"
         if (!instruction) {
             instruction = lang === 'en' ? 'Speak clearly and naturally.' : '自然清晰地朗读。';
         }
@@ -328,10 +379,14 @@ export class BreezeTtsProvider {
                 try {
                     const msg = ctx.chat?.[messageId];
                     if (!msg || msg.is_system || !msg.mes) { return; }
-                    const cleaned = stripForTts(msg.mes, { stripAsterisks: this.settings.stripAsterisks });
-                    const sentences = splitSentences(cleaned);
+                    const cleaned = stripForTts(msg.mes, { stripAsterisks: false, stripOoc: true });
+                    const sentences = [...new Set(
+                        segmentMessage(cleaned)
+                            .filter((s) => s.type !== 'narration')
+                            .flatMap((s) => splitSentences(s.text)),
+                    )];
                     const missing = sentences.filter((s) => !this.emotion.cache.has(hashText(s)));
-                    if (missing.length && this.settings.emotionEnabled) {
+                    if (missing.length && this.settings.emotionEnabled && this.settings.llmBackend !== 'off') {
                         this.emotion.analyzeBatch(missing, this.emotion._recentContext())
                             .catch(() => {});
                     }
@@ -405,6 +460,21 @@ export class BreezeTtsProvider {
         $('#breeze2_rule_fallback').prop('checked', this.settings.ruleFallback).on('change', (e) => {
             this.settings.ruleFallback = Boolean(e.target.checked); this._save();
         });
+        $('#breeze2_llm_backend').val(this.settings.llmBackend).on('change', (e) => {
+            this.settings.llmBackend = String(e.target.value); this._save();
+        });
+        $('#breeze2_tagger_url').val(this.settings.taggerUrl).on('change', (e) => {
+            this.settings.taggerUrl = String(e.target.value ?? '').trim(); this._save();
+        });
+        $('#breeze2_tagger_model').val(this.settings.taggerModel).on('change', (e) => {
+            this.settings.taggerModel = String(e.target.value ?? '').trim(); this._save();
+        });
+        $('#breeze2_tagger_key').val(this.settings.taggerKey).on('change', (e) => {
+            this.settings.taggerKey = String(e.target.value ?? '').trim(); this._save();
+        });
+        $('#breeze2_tagger_timeout').val(this.settings.taggerTimeout).on('change', (e) => {
+            this.settings.taggerTimeout = Math.min(60, Math.max(3, Number(e.target.value) || 12)); this._save();
+        });
         $('#breeze2_cfg1').val(this.settings.intensityCfg[1]);
         $('#breeze2_cfg2').val(this.settings.intensityCfg[2]);
         $('#breeze2_cfg3').val(this.settings.intensityCfg[3]);
@@ -416,14 +486,13 @@ export class BreezeTtsProvider {
         for (const id of ['breeze2_cfg1', 'breeze2_cfg2', 'breeze2_cfg3']) {
             $(`#${id}`).on('change', () => { readCfgMap(); this._save(); });
         }
-        $('#breeze2_lexicon').val(JSON.stringify(this.settings.lexicon, null, 2));
+        $('#breeze2_lexicon').val(JSON.stringify(this.settings.delivery, null, 2));
         $('#breeze2_prompt').val(this.settings.promptTemplate);
         $('#breeze2_apply_prompts').on('click', () => {
             try {
                 const parsed = JSON.parse(val('breeze2_lexicon'));
-                this.settings.lexicon = {
-                    zh: { ...DEFAULT_LEXICON.zh, ...(parsed.zh ?? {}) },
-                    en: { ...DEFAULT_LEXICON.en, ...(parsed.en ?? {}) },
+                this.settings.delivery = {
+                    zh: { ...DEFAULT_DELIVERY.zh, ...(parsed.zh ?? parsed) },
                 };
                 this.settings.promptTemplate = $('#breeze2_prompt').val() || DEFAULT_PROMPT_TEMPLATE;
                 this.emotion.clearCache();
@@ -434,7 +503,7 @@ export class BreezeTtsProvider {
             }
         });
         $('#breeze2_reset_prompts').on('click', () => {
-            this.settings.lexicon = structuredClone(DEFAULT_LEXICON);
+            this.settings.delivery = structuredClone(DEFAULT_DELIVERY);
             this.settings.promptTemplate = DEFAULT_PROMPT_TEMPLATE;
             $('#breeze2_lexicon').val(JSON.stringify(this.settings.lexicon, null, 2));
             $('#breeze2_prompt').val(this.settings.promptTemplate);
@@ -448,6 +517,9 @@ export class BreezeTtsProvider {
 
         // 声线库
         $('#breeze2_voice_list').on('change', () => this._fillEditor());
+        $('#breeze2_narrvoice').on('change', (e) => {
+            this.settings.narrationVoiceId = String(e.target.value ?? ''); this._save();
+        });
         $('#breeze2_voice_add').on('click', () => {
             this._editingId = null; // 新建
             this._fillEditor(true);
@@ -529,6 +601,13 @@ export class BreezeTtsProvider {
         if (current && this.store.get(current)) {
             $('#breeze2_voice_list').val(current);
         }
+        // 旁白声线选择器
+        const narr = String(this.settings.narrationVoiceId ?? '');
+        const narrOptions = [`<option value="">（跟随角色声线）</option>`]
+            .concat(this.store.all().map((v) => `<option value="${v.id}">${v.name}</option>`))
+            .join('');
+        $('#breeze2_narrvoice').html(narrOptions);
+        if (narr && this.store.get(narr)) { $('#breeze2_narrvoice').val(narr); }
     }
 
     _fillEditor(blank = false) {

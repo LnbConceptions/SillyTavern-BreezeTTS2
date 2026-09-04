@@ -58,14 +58,12 @@ export function stripForTts(text, opts = {}) {
     s = s.replace(/!\[([^\]]*)\]\([^)]*\)/g, ' ');
     s = s.replace(/\[([^\]]+)\]\([^)]*\)/g, '$1');
 
-    // 注意：RP 习惯里 *...* 是动作描写而非 markdown 强调，二者同语法；
-    // 这里统一按动作处理（stripAsterisks 控制是否连内容一起删除）。
+    // 注意：**…** 是内心独白、单一 *…* 按用户约定归入旁白；
+    // 星号标记是否删除由调用方决定（分层切分 segmentMessage 需要它们）。
     if (stripAsterisks) {
-        // 动作描写 *...* 与 _..._
-        s = s.replace(/\*[^*\n]{1,400}\*/g, ' ');
-        s = s.replace(/_[^_\n]{1,400}_/g, ' ');
+        s = s.replace(/\*{1,2}[^*\n]{1,400}\*{1,2}/g, ' ');
+        s = s.replace(/_{1,2}[^_\n]{1,400}_{1,2}/g, ' ');
     }
-    s = s.replace(/[*_]+/g, ' ');
 
     if (stripUnknownBrackets) {
         // 方括号：仅保留已知中文事件
@@ -155,4 +153,52 @@ export function hashText(text) {
         h = ((h << 5) + h + s.charCodeAt(i)) | 0;
     }
     return (h >>> 0).toString(36);
+}
+
+// 拟声词（引号内容为拟声词时按旁白平读处理——Router 判别原则之一）
+const ONOMATOPOEIA_RE = /^(嗯+|啊+|哦+|噢+|呜+|滴答|哗啦|轰隆|咔嚓|嗡嗡|叮咚|砰|啪|咚|当啷|呼呼|沙沙|咕嘟|哐当|吱呀|哔剥|噗通)+$/;
+// 引号开头紧邻说话动词 → 一定是台词
+const SPEECH_VERB_RE = /[说问道喊叫答吼念读催催嘟囔嘀咕]$/;
+
+/**
+ * Router 式旁白/台词切分：
+ *  - **…**      → inner（内心想法，用角色声线+情绪朗读）
+ *  - "…" “…” 「…」 『…』 → dialogue 候选（引号文默认按台词处理）
+ *  - 其余       → narration（旁白，平铺直叙、不打标）
+ * 引号的引用/强调/拟声用法（Router 原则的例外）判定为旁白：
+ *  - 内容为拟声词；或
+ *  - 内容 ≤4 字、无句读、且引号开头前不是说话动词
+ * @returns {{type:'narration'|'dialogue'|'inner', text:string}[]}
+ */
+export function segmentMessage(text, { quoteMinLen = 5 } = {}) {
+    const src = String(text ?? '');
+    const out = [];
+    const re = /(\*\*([^*\n]+?)\*\*)|"([^"\n]{1,300})"|(“([^”\n]{1,300})”)|(「([^」\n]{1,300})」)|(『([^』\n]{1,300})』)/g;
+    let last = 0;
+    let m;
+    const push = (type, t) => {
+        const trimmed = t.trim();
+        if (trimmed) { out.push({ type, text: trimmed }); }
+    };
+    while ((m = re.exec(src)) !== null) {
+        if (m.index > last) { push('narration', src.slice(last, m.index)); }
+        if (m[1] !== undefined) {
+            push('inner', m[2]);
+        } else {
+            const inner = (m[3] ?? m[5] ?? m[7] ?? m[9] ?? '').trim();
+            const before = src.slice(Math.max(0, m.index - 3), m.index);
+            const hasPunct = /[。！？!?，,；;…～]$/.test(inner);
+            const isSpeech = inner.length >= quoteMinLen || hasPunct || SPEECH_VERB_RE.test(before);
+            if (isSpeech) {
+                push('dialogue', inner);
+            } else if (ONOMATOPOEIA_RE.test(inner) || inner.length <= 4) {
+                push('narration', inner); // 强调/引用/拟声 → 按旁白平读
+            } else {
+                push('dialogue', inner);
+            }
+        }
+        last = m.index + m[0].length;
+    }
+    if (last < src.length) { push('narration', src.slice(last)); }
+    return out;
 }
