@@ -1,0 +1,65 @@
+{
+  "schema": "breeze2-voices/v1",
+  "voices": [
+    {
+      "name": "旁白（冷静女中音）",
+      "mode": "design",
+      "designInstruction": "一位沉稳的中年女性旁白者，中音区，音色温润而克制，口齿清晰、字正腔圆，语速平稳从容，像纪录片和广播剧的专业讲述者，不带夸张的情绪起伏。",
+      "baseDirection": "",
+      "cfg": 4.0,
+      "seedMode": "random",
+      "seed": 42,
+      "lang": "auto",
+      "refAudio": null,
+      "refText": ""
+    },
+    {
+      "name": "年轻女生（萝莉音）",
+      "mode": "design",
+      "designInstruction": "一个十来岁少女的可爱萝莉音，声线清亮甜软，自带撒娇的黏人语气，吐字伶俐轻快，语速稍快，活泼灵动，偶尔拖长尾音，显得古灵精怪。",
+      "baseDirection": "",
+      "cfg": 4.0,
+      "seedMode": "random",
+      "seed": 42,
+      "lang": "auto",
+      "refAudio": null,
+      "refText": ""
+    },
+    {
+      "name": "成熟女人（御姐音）",
+      "mode": "design",
+      "designInstruction": "一位成熟性感的御姐，低沉魅惑的女中低音，气场高傲、自带压迫感，语速从容不迫，字里行间带着撩人的妩媚，尾音微微下沉、勾人心弦。",
+      "baseDirection": "",
+      "cfg": 4.0,
+      "seedMode": "random",
+      "seed": 42,
+      "lang": "auto",
+      "refAudio": null,
+      "refText": ""
+    },
+    {
+      "name": "年轻男生（少年音）",
+      "mode": "design",
+      "designInstruction": "一位十七八岁少年的清亮男声，青春有活力，明亮响亮、健康向上，吐字干脆利落，语速轻快、富有朝气，情绪饱满有感染力。",
+      "baseDirection": "",
+      "cfg": 4.0,
+      "seedMode": "random",
+      "seed": 42,
+      "lang": "auto",
+      "refAudio": null,
+      "refText": ""
+    },
+    {
+      "name": "成熟男人（低沉磁性）",
+      "mode": "design",
+      "designInstruction": "一位成熟男性的低沉磁性嗓音，胸腔共鸣浑厚沉稳，语速不疾不徐，气场沉稳可靠，像深夜电台的主持人，声音令人安心。",
+      "baseDirection": "",
+      "cfg": 4.0,
+      "seedMode": "random",
+      "seed": 42,
+      "lang": "auto",
+      "refAudio": null,
+      "refText": ""
+    }
+  ]
+}
