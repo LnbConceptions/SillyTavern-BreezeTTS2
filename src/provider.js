@@ -18,6 +18,7 @@ const DEFAULT_SETTINGS = () => ({
     pieceSeconds: 4,
     retries: 4,
     debug: false,
+    speedRate: 1.15,           // 播放倍速（>0 时接管 ST 的 playback_rate，变速不变调）
     // 旁白/台词分层（Router 经验）：旁白平铺直叙不打标
     narrationVoiceId: '',      // 空 = 跟随角色声线
     // 情绪引擎
@@ -181,10 +182,11 @@ export class BreezeTtsProvider {
                 <div class="breeze2-grid3">
                     <label>单块最大字数<input id="breeze2_maxchunk" type="number" min="40" max="180" step="10" /></label>
                     <label>流式片长（秒）<input id="breeze2_piecesec" type="number" min="1" max="10" step="0.5" /></label>
+                    <label>播放倍速（1.15=快15%）<input id="breeze2_speed" type="number" min="0" max="3" step="0.05" /></label>
                     <label>409 重试次数<input id="breeze2_retries" type="number" min="0" max="8" step="1" /></label>
                     <label class="breeze2-checkbox"><input id="breeze2_debug" type="checkbox" /> 调试日志</label>
                 </div>
-                <div class="breeze2-hint">流式片长越小首声越快（引擎 TTFA≈0.13s，首片 2 秒即出声），但片段接缝更频繁；出现明显停顿感可调大到 5~6。</div>
+                <div class="breeze2-hint">流式片长越小首声越快（引擎 TTFA≈0.13s，首片 2 秒即出声），但片段接缝更频繁；出现明显停顿感可调大到 5~6。播放倍速对所有情绪/声线统一生效（变速不变调），设 0 则不接管 ST 的播放速度设置。</div>
             </details>
         </div>`;
     }
@@ -212,8 +214,30 @@ export class BreezeTtsProvider {
 
         this._bindUi();
         this._wirePreAnalysis();
+        this._applySpeedRate();
         this._refreshVoiceUi();
         this._checkHealth();
+    }
+
+    /** 把播放倍速写入 ST 核心的 playback_rate（对所有 TTS 音频生效，变速不变调） */
+    _applySpeedRate() {
+        try {
+            const rate = Number(this.settings.speedRate);
+            if (!rate || rate <= 0) { return; } // 0 = 不接管
+            const ctx = getContext();
+            if (ctx?.extensionSettings?.tts) {
+                ctx.extensionSettings.tts.playback_rate = rate;
+            }
+            const $ = window.jQuery;
+            if ($ && $('#playback_rate').length) {
+                $('#playback_rate').val(rate);
+                $('#playback_rate_counter').val(Number(rate).toFixed(2));
+            }
+            ctx?.saveSettingsDebounced?.();
+            if (this.settings.debug) { console.info(`[BreezeTTS2] 播放倍速已应用: ${rate}x`); }
+        } catch (err) {
+            console.warn('[BreezeTTS2] 应用播放倍速失败:', err?.message ?? err);
+        }
     }
 
     async checkReady() {
@@ -445,6 +469,11 @@ export class BreezeTtsProvider {
         });
         $('#breeze2_piecesec').val(this.settings.pieceSeconds).on('change', (e) => {
             this.settings.pieceSeconds = Math.min(10, Math.max(1, Number(e.target.value) || 4)); this._save();
+        });
+        $('#breeze2_speed').val(this.settings.speedRate).on('change', (e) => {
+            this.settings.speedRate = Math.min(3, Math.max(0, Number(e.target.value) || 0));
+            this._save();
+            this._applySpeedRate();
         });
         $('#breeze2_retries').val(this.settings.retries).on('change', (e) => {
             this.settings.retries = Math.min(8, Math.max(0, Number(e.target.value) || 4));
