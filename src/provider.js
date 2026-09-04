@@ -5,12 +5,47 @@
 
 import { getContext } from '/scripts/extensions.js';
 
-import { BreezeEngineClient, makeSilentWavDataUrl } from './engine-client.js';
+import { BreezeEngineClient, makeSilentWavDataUrl, pcm16ToWavDataUrl } from './engine-client.js';
 import { stripForTts, splitIntoChunks, splitSentences, segmentMessage, detectLang, hashText } from './text.js';
 import { VoiceStore, MUTE_VOICE, defaultVoiceProfiles } from './voices.js';
 import { EmotionEngine, EMOTION_LIST, DEFAULT_DELIVERY, DEFAULT_PROMPT_TEMPLATE, DEFAULT_INTENSITY_CFG } from './emotion.js';
 
 const PROVIDER_NAME = 'Breeze TTS 2';
+const REF_MAX_SECONDS = 30;
+
+/** 解码上传的音频并裁剪到 maxSeconds（24kHz 单声道 WAV）。浏览器环境专用。 */
+async function decodeAndTrimRef(dataUrl, maxSeconds = REF_MAX_SECONDS) {
+    const res = await fetch(dataUrl);
+    const arrayBuffer = await res.arrayBuffer();
+    const AC = window.AudioContext || window.webkitAudioContext;
+    const decodeCtx = new AC();
+    let audioBuf;
+    try {
+        audioBuf = await decodeCtx.decodeAudioData(arrayBuffer.slice(0));
+    } finally {
+        decodeCtx.close?.().catch?.(() => {});
+    }
+    if (audioBuf.duration <= maxSeconds + 0.5) {
+        return { dataUrl, duration: audioBuf.duration, trimmed: false };
+    }
+    const offline = new OfflineAudioContext(1, Math.floor(24000 * maxSeconds), 24000);
+    const srcNode = offline.createBufferSource();
+    srcNode.buffer = audioBuf;
+    srcNode.connect(offline.destination);
+    srcNode.start(0);
+    const rendered = await offline.startRendering();
+    const ch = rendered.getChannelData(0);
+    const pcm = new Int16Array(ch.length);
+    for (let i = 0; i < ch.length; i++) {
+        const s = Math.max(-1, Math.min(1, ch[i]));
+        pcm[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+    }
+    return {
+        dataUrl: pcm16ToWavDataUrl(new Uint8Array(pcm.buffer)),
+        duration: maxSeconds,
+        trimmed: true,
+    };
+}
 
 const DEFAULT_SETTINGS = () => ({
     endpoint: 'http://127.0.0.1:9897',
@@ -734,22 +769,21 @@ export class BreezeTtsProvider {
         const file = e.target.files?.[0];
         if (!file) { return; }
         const reader = new FileReader();
-        reader.onload = () => {
+        reader.onload = async () => {
             const dataUrl = String(reader.result ?? '');
-            this._pendingAudio = {
-                name: file.name,
-                mime: file.type || 'audio/wav',
-                data: dataUrl.slice(dataUrl.indexOf(',') + 1),
-            };
-            // 估算时长，超长提示（长参考会挤占 2048 帧上下文：12.5 帧/秒）
-            const audio = new Audio();
-            audio.preload = 'metadata';
-            audio.src = dataUrl;
-            audio.onloadedmetadata = () => {
-                const sec = Math.round(audio.duration || 0);
+            try {
+                const { dataUrl: finalUrl, duration, trimmed } = await decodeAndTrimRef(dataUrl, REF_MAX_SECONDS);
+                this._pendingAudio = {
+                    name: file.name,
+                    mime: 'audio/wav',
+                    data: finalUrl.slice(finalUrl.indexOf(',') + 1),
+                };
                 $('#breeze2_v_audio_info').text(
-                    `已选择：${file.name}（约 ${sec}s）` + (sec > 30 ? ' ⚠️ 建议裁剪到 30 秒以内' : ''));
-            };
+                    `已选择：${file.name}（${duration.toFixed(1)}s）`
+                    + (trimmed ? ' ⚠️ 超长已自动裁剪为前 30 秒' : ''));
+            } catch (err) {
+                toastr.error(`音频解码失败：${err?.message ?? err}`);
+            }
         };
         reader.readAsDataURL(file);
     }
