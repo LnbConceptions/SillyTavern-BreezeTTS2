@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>Breeze TTS 2 扩展联调台</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="/scripts/extensions/third-party/breeze-tts-2/style.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jquery/3.7.1/jquery.min.js"></script>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 1100px; margin: 24px auto; padding: 0 16px; background: #1a1a22; color: #ddd; }
+  h1 { font-size: 1.3em; } fieldset { border: 1px solid #444; border-radius: 8px; margin: 12px 0; }
+  button, select, textarea, input { background: #26262f; color: #ddd; border: 1px solid #555; border-radius: 6px; padding: 6px 10px; font-size: 0.95em; }
+  button { cursor: pointer; } button:active { transform: translateY(1px); }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin: 8px 0; }
+  #log { font-family: monospace; font-size: 0.82em; background: #12121a; border: 1px solid #333; border-radius: 8px;
+         padding: 10px; height: 260px; overflow-y: auto; white-space: pre-wrap; }
+  .menu_button { background: #3a3a4c; border-radius: 6px; padding: 4px 10px; cursor: pointer; display: inline-flex; gap: 4px; align-items: center; }
+  .breeze2-settings { color: #ddd; }
+  .breeze2-settings input, .breeze2-settings select, .breeze2-settings textarea { color: #ddd; }
+  .ok { color: #7dd97d; } .err { color: #ff7d7d; } .dim { opacity: .6; }
+</style>
+</head>
+<body>
+<h1>🌬️ Breeze TTS 2 扩展联调台（模拟 ST 环境）</h1>
+<p class="dim">加载 <b>/scripts/extensions/third-party/breeze-tts-2/index.js</b>，模拟引擎在 <b>:9899</b>（首个请求 409 一次以测试重试）。</p>
+
+<fieldset>
+  <legend>1. Provider 设置面板（settingsHtml 直渲染）</legend>
+  <div id="tts_provider_settings"></div>
+</fieldset>
+
+<fieldset>
+  <legend>2. 合成链路测试（generateTts 全流程）</legend>
+  <div class="row">
+    <label>声线 <select id="voice"></select></label>
+    <label>voiceMapKey
+      <select id="segkey">
+        <option value='Alice ("Quotes")'>Alice ("Quotes") — 对话</option>
+        <option value='Alice (*Text inside asterisks*)'>Alice (*…*) — 动作</option>
+        <option value='Alice (Other text)'>Alice (Other text) — 旁白</option>
+        <option value=''>（空 — 单声线模式）</option>
+      </select>
+    </label>
+    <label><input type="checkbox" id="llm_fail"> 模拟 LLM 失败（测规则兜底）</label>
+  </div>
+  <textarea id="text" rows="4" style="width:100%">*她轻轻走到他身边，压低了声音。*「别动哦……[笑] 被别人看到就不好了呢。」（oom——窗外传来脚步声）见他没有反抗，她笑得更深了！！</textarea>
+  <div class="row">
+    <button id="gen">▶ 合成并播放</button>
+    <button id="analyze">🎭 只测情绪分析</button>
+    <button id="mute">🔇 静音声线测试</button>
+    <button id="empty">空白文本测试</button>
+    <button id="reset409">重置 409 模拟</button>
+    <button id="refreshengine">刷新引擎回显</button>
+  </div>
+  <div class="row"><span id="gen_status"></span></div>
+</fieldset>
+
+<fieldset>
+  <legend>3. 日志</legend>
+  <div id="log"></div>
+</fieldset>
+
+<fieldset>
+  <legend>4. 模拟引擎收到的表单（/engine-debug/last）</legend>
+  <div id="engine_last" class="dim">（尚无请求）</div>
+</fieldset>
+
+<script>
+// ── ST 环境桩 ──
+window.toastr = { success: m => log('toastr: ' + m, 'ok'), error: m => log('toastr ⚠ ' + m, 'err'),
+                  info: m => log('toastr: ' + m), warning: m => log('toastr ⚠ ' + m) };
+window.POPUP_TYPE = { CONFIRM: 1 };
+window.SillyTavern = { getContext: () => window.__ST_CTX__ };
+
+const SAMPLE_CHAT = [
+  { is_user: true,  name: 'You',   mes: '*我推开门* 你在这里做什么？' },
+  { is_user: false, name: 'Alice', mes: '嘘……小声点。大家都在睡觉呢。' },
+  { is_user: true,  name: 'You',   mes: '那你呢？你也睡不着吗？' },
+];
+window.__ST_CTX__ = {
+  chat: SAMPLE_CHAT,
+  generateQuietPrompt: async ({ quietPrompt }) => {
+    if (document.getElementById('llm_fail').checked) throw new Error('simulated LLM failure');
+    log('LLM 收到 prompt（前 120 字）: ' + quietPrompt.slice(0, 120).replaceAll('\n', ' ⏎ ') + '…', 'dim');
+    const segs = [...quietPrompt.matchAll(/^(\d+): (.+)$/gm)];
+    const lines = segs.map((m, idx) => {
+      const t = m[2];
+      let emotion = '中性', intensity = 1, event = null;
+      if (/！！/.test(t)) { emotion = '亢奋'; intensity = 3; }
+      else if (/……/.test(t)) { emotion = '挑逗'; intensity = 2; }
+      else if (/\[笑\]/.test(t)) { emotion = '开心'; intensity = 2; event = '[笑]'; }
+      else if (/\*|\*/.test(t)) { emotion = '温柔'; intensity = 1; }
+      return { i: Number(m[1]), emotion, intensity, event };
+    });
+    return JSON.stringify({ lines });
+  },
+};
+
+function log(msg, cls = '') {
+  const el = document.getElementById('log');
+  const time = new Date().toTimeString().slice(0, 8);
+  el.innerHTML += `<div class="${cls}">[${time}] ${String(msg).replaceAll('<', '&lt;')}</div>`;
+  el.scrollTop = el.scrollHeight;
+}
+
+let provider = null;
+window.__onProviderRegistered = async (name, cls) => {
+  log(`provider 已注册: ${name}`, 'ok');
+  provider = new cls();
+  document.getElementById('tts_provider_settings').innerHTML = provider.settingsHtml;
+  await provider.loadSettings({});
+  // 把 endpoint 指向模拟引擎
+  document.getElementById('breeze2_endpoint').value = 'http://127.0.0.1:9899';
+  provider.settings.endpoint = 'http://127.0.0.1:9899';
+  provider.client.setEndpoint('http://127.0.0.1:9899');
+  const voices = await provider.fetchTtsVoiceObjects();
+  const sel = document.getElementById('voice');
+  sel.innerHTML = voices.map(v => `<option value="${v.voice_id}">${v.name}</option>`).join('');
+  log(`声线列表: ${voices.map(v => v.name).join(' / ')}`, 'ok');
+  window.__onSettingsSaved = () => log('settings saved（saveTtsProviderSettings 被调用）', 'dim');
+};
+
+document.getElementById('gen').onclick = async () => {
+  if (!provider) return log('provider 未就绪', 'err');
+  const text = document.getElementById('text').value;
+  const voiceId = document.getElementById('voice').value;
+  const voiceMapKey = document.getElementById('segkey').value;
+  const st = document.getElementById('gen_status');
+  st.textContent = '合成中…';
+  const t0 = performance.now();
+  try {
+    let n = 0, bytes = 0;
+    for await (const wavUrl of provider.generateTts(text, voiceId, voiceMapKey)) {
+      n++;
+      bytes += wavUrl.length;
+      log(`yield 块 ${n}: ${(wavUrl.length * 0.75 / 1024).toFixed(0)}KB`);
+      await new Audio(wavUrl).play().catch(e => log('播放被浏览器拦截（正常，可点页面后重试）: ' + e.message, 'err'));
+    }
+    st.innerHTML = `<span class="ok">✅ ${n} 块 / ${(bytes * 0.75 / 1024).toFixed(0)}KB / ${(performance.now() - t0).toFixed(0)}ms</span>`;
+    refreshEngine();
+  } catch (e) {
+    st.innerHTML = `<span class="err">❌ ${e.message}</span>`;
+    log('合成失败: ' + e.message, 'err');
+  }
+};
+
+document.getElementById('analyze').onclick = async () => {
+  const text = document.getElementById('text').value;
+  const cleaned = (await import('/scripts/extensions/third-party/breeze-tts-2/src/text.js'));
+  const chunks = cleaned.splitIntoChunks(cleaned.stripForTts(text, { stripAsterisks: true }), provider.settings.maxChunkChars);
+  log('分块结果: ' + JSON.stringify(chunks, null, 1), 'dim');
+  for (const chunk of chunks) {
+    const res = await provider.emotion.resolveForChunk(chunk);
+    log(`「${chunk.slice(0, 24)}…」 → ${JSON.stringify(res)} → 指令: ${provider.emotion.compileInstruction('', res, 'zh')}`, res.byRule ? 'dim' : 'ok');
+  }
+};
+
+document.getElementById('mute').onclick = async () => {
+  const it = provider.generateTts('这段不会发声', 'breeze2:mute', '');
+  const out = [];
+  for await (const x of it) out.push(x);
+  log(`静音声线 yield 数: ${out.length}（应为 0）`, out.length === 0 ? 'ok' : 'err');
+};
+
+document.getElementById('empty').onclick = async () => {
+  const voiceId = document.getElementById('voice').value;
+  const out = [];
+  for await (const x of provider.generateTts('((())) *** ```code```', voiceId, '')) out.push(x);
+  log(`清洗后为空的文本 yield 数: ${out.length}（应为 0）`, out.length === 0 ? 'ok' : 'err');
+};
+
+document.getElementById('reset409').onclick = async () => {
+  await fetch('http://127.0.0.1:9899/engine-debug/reset409');
+  log('已重置 409 模拟', 'dim');
+};
+
+async function refreshEngine() {
+  const r = await (await fetch('http://127.0.0.1:9899/engine-debug/last')).json();
+  document.getElementById('engine_last').innerHTML =
+    '<pre>' + JSON.stringify(r, null, 1).replaceAll('<', '&lt;') + '</pre>';
+}
+document.getElementById('refreshengine').onclick = refreshEngine;
+</script>
+</body>
+</html>

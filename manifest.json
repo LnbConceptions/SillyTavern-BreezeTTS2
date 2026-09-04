@@ -1,0 +1,14 @@
+{
+    "display_name": "Breeze TTS 2",
+    "loading_order": 100,
+    "requires": [],
+    "optional": [],
+    "dependencies": [],
+    "js": "index.js",
+    "css": "style.css",
+    "author": "saga",
+    "version": "1.0.0",
+    "homePage": "",
+    "auto_update": false,
+    "minimum_client_version": "1.12.0"
+}

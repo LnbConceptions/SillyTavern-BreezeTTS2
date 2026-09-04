@@ -1,0 +1,8 @@
+# 临时产物
+test/provider.e2e.tmp.mjs
+src/provider.e2e.tmp.mjs
+*.log
+__pycache__/
+*.pyc
+.DS_Store
+node_modules/
