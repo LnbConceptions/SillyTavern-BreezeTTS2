@@ -69,11 +69,12 @@ test('hashText 稳定且不同文本不同', () => {
 });
 
 // ── Router 式分层 segmentMessage ──
-test('segmentMessage 旁白/台词/内心三分', () => {
+test('segmentMessage 旁白/引号/内心三分（引号交 LLM 判定）', () => {
     const segs = T.segmentMessage('**她凑到他耳边。**「别动哦。」他的心跳快得厉害。');
-    assert.deepEqual(segs.map((s) => s.type), ['inner', 'dialogue', 'narration']);
+    assert.deepEqual(segs.map((s) => s.type), ['inner', 'quote', 'narration']);
     assert.equal(segs[0].text, '她凑到他耳边。');
     assert.equal(segs[1].text, '别动哦。');
+    assert.ok(segs[1].before.length > 0, 'quote 段携带前置上下文');
     assert.ok(segs[2].text.includes('心跳'));
 });
 
@@ -84,23 +85,17 @@ test('segmentMessage 单星号动作按旁白处理', () => {
     assert.ok(segs[0].text.includes('她挥了挥手') && segs[0].text.includes('走吧'));
 });
 
-test('segmentMessage 引用/强调/拟声按旁白平读', () => {
-    // 短引号内容 + 前面无说话动词 → 旁白
-    const segs1 = T.segmentMessage('他所谓的"自由"不过是逃避罢了。');
-    assert.equal(segs1[0].type, 'narration', JSON.stringify(segs1));
-    // 拟声词
-    const segs2 = T.segmentMessage('门外传来"咚咚"的敲门声。');
-    assert.ok(segs2.every((s) => s.type === 'narration'), JSON.stringify(segs2));
-    // 说话动词开头 → 台词
-    const segs3 = T.segmentMessage('他低声"说"了一句什么。'.replace('低声"说"了一句什么', '他低声道："跟我来。"'));
-    assert.ok(segs3.some((s) => s.type === 'dialogue' && s.text === '跟我来。'), JSON.stringify(segs3));
-});
-
-test('segmentMessage 引号内长句默认是台词（Router 原则）', () => {
-    const segs = T.segmentMessage('她笑了：「你真的这么想吗？」');
-    assert.equal(segs[0].type, 'narration');
-    assert.equal(segs[1].type, 'dialogue');
-    assert.equal(segs[1].text, '你真的这么想吗？');
+test('heuristicIsSpeech 程序启发兜底', () => {
+    // 拟声词 → 非台词
+    assert.equal(T.heuristicIsSpeech('咚咚', '门外传来'), false);
+    // 短且无句读、前面无说话动词 → 非台词（强调/引用）
+    assert.equal(T.heuristicIsSpeech('自由', '他所谓的'), false);
+    // 带句读 → 台词
+    assert.equal(T.heuristicIsSpeech('你真的这么想吗？', '她笑了：'), true);
+    // 前面是说话动词 → 台词
+    assert.equal(T.heuristicIsSpeech('滚', '他吼道：'), true);
+    // 长句默认台词（Router 原则）
+    assert.equal(T.heuristicIsSpeech('这是一句很长很完整的话'), true);
 });
 
 // ── engine-client.js ──
@@ -180,6 +175,42 @@ test('resolveForChunk 数字协议：LLM 打标 + 缓存', async () => {
     const r2 = await engine.resolveForChunk('凑过来，小声说：别动哦。别让我等太久！');
     assert.equal(calls, 1, '第二次命中缓存');
     assert.ok(r2.emotion === '挑逗');
+});
+
+test('analyzeQuotes：引号判定 0=旁白、情绪数字=台词', async () => {
+    const settings = {
+        emotionEnabled: true, llmBackend: 'api', taggerUrl: 'http://tagger.local/v1',
+        ruleFallback: true,
+        delivery: M.DEFAULT_DELIVERY, promptTemplate: M.DEFAULT_PROMPT_TEMPLATE,
+        quotePromptTemplate: M.DEFAULT_QUOTE_PROMPT, intensityCfg: {},
+    };
+    const engine = new M.EmotionEngine(settings, null);
+    engine._callLLM = async (prompt) => {
+        assert.ok(prompt.includes('引号片段'));
+        return '1: 0\n2: 8';
+    };
+    await engine.analyzeQuotes([
+        { text: '自由', before: '他所谓的' },
+        { text: '别急着走，好戏才刚开始。', before: '她贴近他耳边' },
+    ]);
+    const v1 = await engine.resolveQuote('自由');
+    assert.equal(v1.isSpeech, false, '强调引用 → 旁白');
+    const v2 = await engine.resolveQuote('别急着走，好戏才刚开始。');
+    assert.equal(v2.isSpeech, true, '真台词');
+    assert.equal(v2.emotion, '渐入佳境');
+    // 台词判定的情绪已写入句级缓存 → resolveForChunk 命中
+    const r = await engine.resolveForChunk('别急着走，好戏才刚开始。');
+    assert.equal(r.emotion, '渐入佳境');
+});
+
+test('resolveQuote 启发兜底（LLM 关闭）', async () => {
+    const settings = {
+        emotionEnabled: true, llmBackend: 'off', ruleFallback: true,
+        delivery: M.DEFAULT_DELIVERY, quotePromptTemplate: M.DEFAULT_QUOTE_PROMPT, intensityCfg: {},
+    };
+    const engine = new M.EmotionEngine(settings, null);
+    assert.equal((await engine.resolveQuote('咚咚', { skipLLM: false })).isSpeech, false);
+    assert.equal((await engine.resolveQuote('这是一句完整的台词，带着情绪。')).isSpeech, true);
 });
 
 test('resolveForChunk 首块 skipLLM 立即出声', async () => {

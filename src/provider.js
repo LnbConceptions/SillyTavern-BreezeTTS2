@@ -303,8 +303,7 @@ export class BreezeTtsProvider {
         });
         if (!cleaned) { return; }
 
-        // 分层策略：若 ST 多声线模式已经分好段（voiceMapKey 带标记），尊重其分段；
-        // 否则用本插件的 Router 式切分（narration/dialogue/inner）
+        // 分层（纯程序判定）：narration/inner 直确定；quote 交 LLM 判定是否台词
         const stType = segmentTypeFromKey(voiceMapKey);
         const segs = voiceMapKey && stType
             ? [{ type: stType, text: cleaned }]
@@ -316,25 +315,38 @@ export class BreezeTtsProvider {
 
         const narrationProfile = this.store.get(this.settings.narrationVoiceId) ?? profile;
 
-        // 后台预热台词部分的情绪缓存（不阻塞首块）
-        const diaSentences = [...new Set(
-            segs.filter((s) => s.type !== 'narration').flatMap((s) => splitSentences(s.text)),
+        // 后台预热（不阻塞首块）：① 引号"是否台词"判定 ② 内心想法的情绪打标
+        const quotes = segs.filter((s) => s.type === 'quote');
+        if (quotes.length && this.settings.emotionEnabled && this.settings.llmBackend !== 'off') {
+            this.emotion.analyzeQuotes(quotes, this.emotion._recentContext()).catch(() => {});
+        }
+        const innerSentences = [...new Set(
+            segs.filter((s) => s.type === 'inner').flatMap((s) => splitSentences(s.text)),
         )];
-        const missing = diaSentences.filter((s) => !this.emotion.cache.has(hashText(s)));
-        if (missing.length && this.settings.emotionEnabled && this.settings.llmBackend !== 'off') {
-            this.emotion.analyzeBatch(missing, this.emotion._recentContext()).catch(() => {});
+        const missingInner = innerSentences.filter((s) => !this.emotion.cache.has(hashText(s)));
+        if (missingInner.length && this.settings.emotionEnabled && this.settings.llmBackend !== 'off') {
+            this.emotion.analyzeBatch(missingInner, this.emotion._recentContext()).catch(() => {});
         }
 
         for (const seg of segs) {
-            const voice = seg.type === 'narration' ? narrationProfile : profile;
-            // 旁白段清掉残留的星号/下划线符号
-            const segText = seg.type === 'narration'
-                ? seg.text.replace(/[*_]+/g, '').trim()
-                : seg.text;
+            let segType = seg.type;
+            let segText = seg.text;
+            let voice = profile;
+
+            // 引号段：LLM 判定是否台词（0.2s 级，值得等）；非台词 → 归旁白平读
+            if (segType === 'quote') {
+                const verdict = await this.emotion.resolveQuote(segText);
+                if (!verdict.isSpeech) { segType = 'narration'; }
+            }
+            if (segType === 'narration') {
+                voice = narrationProfile;
+                segText = segText.replace(/[*_]+/g, '').trim();
+            }
             const chunks = splitIntoChunks(segText, this.settings.maxChunkChars);
             if (!chunks.length) { continue; }
             for (const [i, chunk] of chunks.entries()) {
-                const req = await this._buildRequest(chunk, voice, seg.type, { skipLLM: i === 0 });
+                // 多块时段首块跳过 LLM 立即出声（后续块用打标结果）；单块则等打标
+                const req = await this._buildRequest(chunk, voice, segType, { skipLLM: i === 0 && chunks.length > 1 });
                 yield* this.client.synthesizeStream(req, this.settings.pieceSeconds, 2);
             }
         }
@@ -405,15 +417,21 @@ export class BreezeTtsProvider {
                     const msg = ctx.chat?.[messageId];
                     if (!msg || msg.is_system || !msg.mes) { return; }
                     const cleaned = stripForTts(msg.mes, { stripAsterisks: false, stripOoc: true });
-                    const sentences = [...new Set(
-                        segmentMessage(cleaned)
-                            .filter((s) => s.type !== 'narration')
-                            .flatMap((s) => splitSentences(s.text)),
+                    const segs = segmentMessage(cleaned);
+                    if (!segs.length || !this.settings.emotionEnabled
+                        || this.settings.llmBackend === 'off') { return; }
+                    const contextLines = this.emotion._recentContext();
+                    // ① 引号"是否台词"判定 ② 内心想法情绪打标 —— 都在后台跑
+                    const quotes = segs.filter((s) => s.type === 'quote');
+                    if (quotes.length) {
+                        this.emotion.analyzeQuotes(quotes, contextLines).catch(() => {});
+                    }
+                    const innerSentences = [...new Set(
+                        segs.filter((s) => s.type === 'inner').flatMap((s) => splitSentences(s.text)),
                     )];
-                    const missing = sentences.filter((s) => !this.emotion.cache.has(hashText(s)));
-                    if (missing.length && this.settings.emotionEnabled && this.settings.llmBackend !== 'off') {
-                        this.emotion.analyzeBatch(missing, this.emotion._recentContext())
-                            .catch(() => {});
+                    const missing = innerSentences.filter((s) => !this.emotion.cache.has(hashText(s)));
+                    if (missing.length) {
+                        this.emotion.analyzeBatch(missing, contextLines).catch(() => {});
                     }
                 } catch { /* 预分析失败不影响朗读 */ }
             });

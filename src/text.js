@@ -155,30 +155,46 @@ export function hashText(text) {
     return (h >>> 0).toString(36);
 }
 
-// 拟声词（引号内容为拟声词时按旁白平读处理——Router 判别原则之一）
+// 拟声词（引号内容为拟声词 → 不是台词，按旁白平读）
 const ONOMATOPOEIA_RE = /^(嗯+|啊+|哦+|噢+|呜+|滴答|哗啦|轰隆|咔嚓|嗡嗡|叮咚|砰|啪|咚|当啷|呼呼|沙沙|咕嘟|哐当|吱呀|哔剥|噗通)+$/;
 // 引号开头紧邻说话动词 → 一定是台词
-const SPEECH_VERB_RE = /[说问道喊叫答吼念读催催嘟囔嘀咕]$/;
+const SPEECH_VERB_RE = /[说问道喊叫答吼念读催嘟囔嘀咕]$/;
 
 /**
- * Router 式旁白/台词切分：
- *  - **…**      → inner（内心想法，用角色声线+情绪朗读）
- *  - "…" “…” 「…」 『…』 → dialogue 候选（引号文默认按台词处理）
- *  - 其余       → narration（旁白，平铺直叙、不打标）
- * 引号的引用/强调/拟声用法（Router 原则的例外）判定为旁白：
- *  - 内容为拟声词；或
- *  - 内容 ≤4 字、无句读、且引号开头前不是说话动词
- * @returns {{type:'narration'|'dialogue'|'inner', text:string}[]}
+ * 引号内容的程序级启发判断（LLM 不可用时的兜底；Router 原则：默认按台词处理）。
+ * 判为非台词：拟声词；或 ≤4 字、无句读、且引号前不是说话动词（强调/引用）。
  */
-export function segmentMessage(text, { quoteMinLen = 5 } = {}) {
+export function heuristicIsSpeech(inner, before = '') {
+    const t = String(inner ?? '').trim();
+    if (!t) { return false; }
+    if (ONOMATOPOEIA_RE.test(t)) { return false; }
+    if (/[。！？!?，,；;…～]$/.test(t)) { return true; }
+    const beforeClean = String(before ?? '').replace(/[：:，,。\s""」』]+$/u, '');
+    if (SPEECH_VERB_RE.test(beforeClean.slice(-2))) { return true; }
+    if (t.length <= 4) { return false; }
+    return true;
+}
+
+/**
+ * Router 式旁白/台词切分（纯程序判定，不用 LLM）：
+ *  - **…**  → inner（内心想法，角色声线+情绪朗读）
+ *  - "…" “…” 「…」 『…』 → quote（引号内容，是否台词由 LLM 判定，程序启发兜底）
+ *  - 其余   → narration（旁白，平铺直叙、不打标）
+ * @returns {{type:'narration'|'dialogue'|'inner'|'quote', text:string, before?:string}[]}
+ */
+export function segmentMessage(text) {
     const src = String(text ?? '');
     const out = [];
     const re = /(\*\*([^*\n]+?)\*\*)|"([^"\n]{1,300})"|(“([^”\n]{1,300})”)|(「([^」\n]{1,300})」)|(『([^』\n]{1,300})』)/g;
     let last = 0;
     let m;
-    const push = (type, t) => {
+    const push = (type, t, before = '') => {
         const trimmed = t.trim();
-        if (trimmed) { out.push({ type, text: trimmed }); }
+        if (trimmed) {
+            const seg = { type, text: trimmed };
+            if (before) { seg.before = before; }
+            out.push(seg);
+        }
     };
     while ((m = re.exec(src)) !== null) {
         if (m.index > last) { push('narration', src.slice(last, m.index)); }
@@ -186,16 +202,8 @@ export function segmentMessage(text, { quoteMinLen = 5 } = {}) {
             push('inner', m[2]);
         } else {
             const inner = (m[3] ?? m[5] ?? m[7] ?? m[9] ?? '').trim();
-            const before = src.slice(Math.max(0, m.index - 3), m.index);
-            const hasPunct = /[。！？!?，,；;…～]$/.test(inner);
-            const isSpeech = inner.length >= quoteMinLen || hasPunct || SPEECH_VERB_RE.test(before);
-            if (isSpeech) {
-                push('dialogue', inner);
-            } else if (ONOMATOPOEIA_RE.test(inner) || inner.length <= 4) {
-                push('narration', inner); // 强调/引用/拟声 → 按旁白平读
-            } else {
-                push('dialogue', inner);
-            }
+            const before = src.slice(Math.max(0, m.index - 12), m.index);
+            push('quote', inner, before);
         }
         last = m.index + m[0].length;
     }

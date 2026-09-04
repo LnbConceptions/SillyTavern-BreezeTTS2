@@ -82,17 +82,14 @@ window.__ST_CTX__ = {
   generateQuietPrompt: async ({ quietPrompt }) => {
     if (document.getElementById('llm_fail').checked) throw new Error('simulated LLM failure');
     log('LLM 收到 prompt（前 120 字）: ' + quietPrompt.slice(0, 120).replaceAll('\n', ' ⏎ ') + '…', 'dim');
-    const segs = [...quietPrompt.matchAll(/^(\d+): (.+)$/gm)];
-    const lines = segs.map((m, idx) => {
-      const t = m[2];
-      let emotion = '中性', intensity = 1, event = null;
-      if (/！！/.test(t)) { emotion = '亢奋'; intensity = 3; }
-      else if (/……/.test(t)) { emotion = '挑逗'; intensity = 2; }
-      else if (/\[笑\]/.test(t)) { emotion = '开心'; intensity = 2; event = '[笑]'; }
-      else if (/\*|\*/.test(t)) { emotion = '温柔'; intensity = 1; }
-      return { i: Number(m[1]), emotion, intensity, event };
-    });
-    return JSON.stringify({ lines });
+    const lines = [...quietPrompt.matchAll(/^\d+[.:]\s?(.+)$/gm)];
+    return lines.map((m) => {
+      const t = m[1];
+      if (/！！/.test(t)) return '9';
+      if (/……/.test(t)) return '7';
+      if (/\[笑\]/.test(t)) return '1';
+      return '6';
+    }).join('');
   },
 };
 

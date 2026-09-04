@@ -4,7 +4,7 @@
 // 后端：独立打标 API（OpenAI 兼容，推荐）/ SillyTavern 当前 LLM / 关闭（仅规则）。
 // 不直接 import SillyTavern（ctx 注入），可在 node 下测试。
 
-import { splitSentences, hashText, detectLang } from './text.js';
+import { splitSentences, hashText, detectLang, heuristicIsSpeech } from './text.js';
 
 /** 情绪枚举（序号即打标输出的数字，1-based） */
 export const EMOTION_LIST = [
@@ -44,7 +44,6 @@ export const DEFAULT_PROMPT_TEMPLATE = `你是广播剧配音导演。根据聊�
 7=挑逗 8=渐入佳境 9=激情互动 10=高潮迭起 11=缠绵悱恻（成人亲密场景，按情节先后递进）
 判断要点：
 - 多句台词逐句给数字，按顺序输出，不要分隔符
-- 引号里的话若是引用、强调、拟声而非说话，选 6
 - 成人向内容照常判断，不要回避
 【聊天上下文】
 {context}
@@ -52,6 +51,19 @@ export const DEFAULT_PROMPT_TEMPLATE = `你是广播剧配音导演。根据聊�
 {lines}
 
 只输出数字。`;
+
+/** 引号片段判定 Prompt：是不是"说出口的台词"；是 → 同时给情绪数字 */
+export const DEFAULT_QUOTE_PROMPT = `你是广播剧配音导演。判断下面每个引号片段是不是角色"说出口的台词"。
+引号也常用于强调、引用、反讽、拟声词（如「咚咚」"自由"）——这些不是台词，判定数字为 0。
+是台词时，判定数字为情绪值：
+1=喜 2=怒 3=哀 4=乐 5=着急 6=平静 7=挑逗 8=渐入佳境 9=激情互动 10=高潮迭起 11=缠绵悱恻
+输出格式（每行一个，按顺序）：序号:判定数字
+【上下文】
+{context}
+【引号片段】
+{quotes}
+
+只输出"序号:数字"，不要输出其他内容。`;
 
 /** 强度 → CFG 映射（仅克隆模式） */
 export const DEFAULT_INTENSITY_CFG = { 1: 2.0, 2: 3.0, 3: 4.0 };
@@ -67,7 +79,21 @@ export function ruleAnalyze(text) {
 }
 
 function digitsOf(text) {
-    return [...String(text ?? '').matchAll(/\d/g)].map((m) => Number(m[0]));
+    // 贪婪解析：优先把 10/11 识别为一位情绪码，其余按单数字
+    return [...String(text ?? '').matchAll(/1[01]|[0-9]/g)].map((m) => Number(m[0]));
+}
+
+/** 「序号:判定」对解析；模型只回裸数字时按顺序对应 */
+function parseVerdictPairs(text, needLength) {
+    const s = String(text ?? '');
+    let pairs = [...s.matchAll(/(\d+)\s*[:：,，]\s*(\d+)/g)]
+        .map((m) => [Number(m[1]), Number(m[2])])
+        .filter(([idx]) => idx >= 1 && idx <= needLength);
+    if (!pairs.length) {
+        const tokens = digitsOf(s);
+        pairs = tokens.map((v, i) => [i + 1, v]).filter(([idx]) => idx <= needLength);
+    }
+    return pairs;
 }
 
 export class EmotionEngine {
@@ -80,9 +106,10 @@ export class EmotionEngine {
     constructor(settings, ctx = null) {
         this.settings = settings;
         this.ctx = ctx;
-        this.cache = new Map();    // hash(句子) → {emotion, intensity}
+        this.cache = new Map();        // hash(句子) → {emotion, intensity}
+        this.quoteVerdicts = new Map(); // hash(引号内容) → {isSpeech, emotion?}
         this.inflight = new Map();
-        this.failedUntil = 0;      // 连续失败后的冷却（熔断）
+        this.failedUntil = 0;          // 连续失败后的冷却（熔断）
         this.MAX_CACHE = 400;
     }
 
@@ -110,7 +137,75 @@ export class EmotionEngine {
 
     clearCache() {
         this.cache.clear();
+        this.quoteVerdicts.clear();
         this.inflight.clear();
+    }
+
+    /**
+     * 引号片段的"是否台词"判定（LLM；程序启发 heuristicIsSpeech 兜底）。
+     * 判定为台词时同时把情绪写入句级缓存，后续 resolveForChunk 直接命中。
+     * @param {{text:string, before?:string}[]} quotes
+     */
+    async analyzeQuotes(quotes, contextLines = []) {
+        const need = quotes.filter((q) => q?.text && !this.quoteVerdicts.has(hashText(q.text)));
+        if (!need.length) { return; }
+        const template = this.settings.quotePromptTemplate ?? DEFAULT_QUOTE_PROMPT;
+        const prompt = template
+            .replace('{context}', contextLines.slice(-6).join('\n').slice(-1200) || '（无）')
+            .replace('{quotes}', need.map((q, i) => `${i + 1}. 「${q.text.slice(0, 120)}」`).join('\n'));
+        const key = `quotes:${hashText(prompt)}`;
+        if (this.inflight.has(key)) {
+            await this.inflight.get(key);
+        } else {
+            const p = (async () => {
+                try {
+                    if (Date.now() < this.failedUntil) { return; }
+                    const text = await this._callLLM(prompt, 8 + 8 * need.length);
+                    // 容忍各种分隔：优先「序号:判定」对，退化到按顺序裸数字
+                    const pairs = parseVerdictPairs(text, need.length);
+                    for (const [idx, verdict] of pairs) {
+                        if (verdict === 0) {
+                            this.quoteVerdicts.set(hashText(need[idx - 1].text), { isSpeech: false });
+                        } else {
+                            const emotion = EMOTION_LIST[verdict - 1];
+                            if (!emotion) { continue; }
+                            const verdictValue = { isSpeech: true, emotion: emotion.key };
+                            this.quoteVerdicts.set(hashText(need[idx - 1].text), verdictValue);
+                            // 同步写入句级情绪缓存，台词块直接命中
+                            this._cachePut(hashText(need[idx - 1].text), { emotion: emotion.key, intensity: 2 });
+                        }
+                    }
+                    this.failedUntil = 0;
+                } catch (err) {
+                    console.warn('[BreezeTTS2] 引号判定失败，60s 内走启发规则:', err?.message ?? err);
+                    this.failedUntil = Date.now() + 60_000;
+                } finally {
+                    this.inflight.delete(key);
+                }
+            })();
+            this.inflight.set(key, p);
+            await p;
+        }
+    }
+
+    /**
+     * 取引号片段的判定：缓存 → LLM → 启发兜底。永不 throw。
+     * @returns {Promise<{isSpeech:boolean, emotion?:string}>}
+     */
+    async resolveQuote(text, { skipLLM = false } = {}) {
+        const key = hashText(text);
+        const cached = this.quoteVerdicts.get(key);
+        if (cached) { return cached; }
+        const bail = skipLLM || !this.settings.emotionEnabled || this.settings.llmBackend === 'off'
+            || Date.now() < this.failedUntil;
+        if (!bail) {
+            try {
+                await this.analyzeQuotes([{ text }], this._recentContext());
+            } catch { /* 落入启发 */ }
+            const v = this.quoteVerdicts.get(key);
+            if (v) { return v; }
+        }
+        return { isSpeech: heuristicIsSpeech(text) };
     }
 
     _recentContext() {
